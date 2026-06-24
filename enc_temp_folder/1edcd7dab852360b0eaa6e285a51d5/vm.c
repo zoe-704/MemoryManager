@@ -954,6 +954,29 @@ full_virtual_memory_test(
     // Pass virtual address size to both threads as parameter
     ULONG_PTR chunks = virtual_address_size_in_unsigned_chunks;
 
+    // Create two page fault threads
+    HANDLE threads[2];
+    threads[0] = CreateThread(
+        NULL,                   // default security
+        0,                      // default stack size
+        handle_page_fault,      // function to run
+        &chunks,                // parameter passed to function
+        0,                      // start immediately
+        NULL                    // don't need thread ID
+    );
+    threads[1] = CreateThread(
+        NULL,
+        0,
+        handle_page_fault,
+        &chunks,
+        0,
+        NULL
+    );
+
+    if (threads[0] == NULL || threads[1] == NULL) {
+        printf("Failed to create threads. Error: %lu\n", GetLastError());
+        return;
+    }
 
 
     //
