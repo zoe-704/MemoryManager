@@ -115,11 +115,13 @@
 #define PTES_PER_LOCK 512
 
 #define NUM_FAULT_THREADS 8
-#define NUM_THREADS       11     // 2 fault + trim + disc
+#define NUM_THREADS       12     
 
 #define INVALID_DISC_SLOT ((1ULL << MAX_DISC_PTE_BITS) - 1)
 
 #define AGES 8
+
+#define PERIOD_MS 1000
 
 #define DEBUG 1
 
@@ -1018,6 +1020,27 @@ AgeListTick(
     }
 }
 
+// Commit only the page(s) of the reserved PFN table that hold this frame's slot.
+// Idempotent: MEM_COMMIT on already-committed memory succeeds and is cheap.
+VOID
+ensure_metadata_slot_is_committed(
+    ULONG64 frame
+) {
+    PVOID slot_addr = (PVOID)&physical_slots[frame];
+
+    // A slot can straddle a page boundary, so commit the whole span it covers.
+    PVOID start = (PVOID)((ULONG_PTR)slot_addr & ~((ULONG_PTR)PAGE_SIZE - 1));
+    PVOID last = (PVOID)(((ULONG_PTR)slot_addr + sizeof(pfn_metadata) - 1)
+        & ~((ULONG_PTR)PAGE_SIZE - 1));
+    SIZE_T span = (ULONG_PTR)last - (ULONG_PTR)start + PAGE_SIZE;
+
+    if (VirtualAlloc(start, span, MEM_COMMIT, PAGE_READWRITE) == NULL) {
+        printf("ensure_metadata_slot_is_committed: commit failed for frame %llu, error %lu\n",
+            frame, GetLastError());
+        DebugBreak();
+    }
+}
+
 // Initializations
 // Initialize pte lists
 VOID
@@ -1046,7 +1069,7 @@ init_pfn_metadata(
     physical_slots = VirtualAlloc(
         NULL,
         table_reserve_size,
-        MEM_RESERVE | MEM_COMMIT,
+        MEM_RESERVE,
         PAGE_READWRITE
     );
     if (physical_slots == NULL) {
@@ -1056,16 +1079,39 @@ init_pfn_metadata(
     }
 
     // Setup pfn metadata in physical_slots and add to free list
-    for (int i = 0; i < physical_page_count; i++) {
+    for (ULONG_PTR i = 0; i < physical_page_count; i++) {
         ULONG64 frame = physical_page_numbers[i];
+        
+        ensure_metadata_slot_is_committed(frame);
 
         physical_slots[frame].frame_number = frame;
+        physical_slots[frame].pte = NULL;
+        physical_slots[frame].disc_index = INVALID_DISC_SLOT;
         physical_slots[frame].list_type = 0;
+        physical_slots[frame].unmap_pending = 0;
+        physical_slots[frame].being_written = 0;
+        physical_slots[frame].accessed = 0;
+        physical_slots[frame].owner_thread_id = 0;
+
         InitializeListHead(&physical_slots[frame].links);
         InitializeCriticalSectionAndSpinCount(&physical_slots[frame].lock, 0x00FFFFFF);
         InsertTailList(&freeList_head.entry, &physical_slots[frame].links);
         freeList_head.list_count++;
     }
+    // Commit only the used parts of pfn_metadata sparse array
+    // Report actual commit footprint
+    MEMORY_BASIC_INFORMATION mbi;
+    ULONG_PTR committed = 0;
+    PCHAR addr = (PCHAR)physical_slots;
+    PCHAR end = addr + table_reserve_size;
+    while (addr < end && VirtualQuery(addr, &mbi, sizeof(mbi))) {
+        if (mbi.State == MEM_COMMIT) committed += mbi.RegionSize;
+        addr += mbi.RegionSize;
+    }
+    printf("PFN table: committed %llu MB of %llu MB reserved (%llu frames)\n",
+        (ULONG64)committed / MB(1),
+        (ULONG64)table_reserve_size / MB(1),
+        (ULONG64)physical_page_count);
 }
 
 // Initialize disc
@@ -2008,6 +2054,19 @@ age_thread(
     return 0;
 }
 
+// thread type 5: periodic
+DWORD WINAPI
+periodic_thread(
+    PVOID parameter
+) {
+    thread_index = (int)(ULONG_PTR)parameter;
+    while (trim_running) {
+        DWORD r = WaitForSingleObject(shutdown_event, PERIOD_MS);
+        if (r == WAIT_OBJECT_0) break;   // shutdown signalled
+        if (!trim_running) break;
+    }
+    return 0;
+}
 
 VOID
 full_virtual_memory_test(
@@ -2042,6 +2101,7 @@ full_virtual_memory_test(
     threads[NUM_FAULT_THREADS] = CreateThread(NULL, 0, trim_thread, (PVOID)(ULONG_PTR)8, 0, NULL);
     threads[NUM_FAULT_THREADS+1] = CreateThread(NULL, 0, disc_thread, (PVOID)(ULONG_PTR)9, 0, NULL);
     threads[NUM_FAULT_THREADS+2] = CreateThread(NULL, 0, age_thread, (PVOID)(ULONG_PTR)10, 0, NULL);
+    threads[NUM_FAULT_THREADS+3] = CreateThread(NULL, 0, periodic_thread, (PVOID)(ULONG_PTR)10, 0, NULL);
 
     if (threads[0] == NULL || threads[1] == NULL || threads[2] == NULL) {
         printf("Failed to create threads. Error: %lu\n", GetLastError());
@@ -2056,9 +2116,10 @@ full_virtual_memory_test(
     SetEvent(diskReady_event);
     SetEvent(modifiedReady_event);
     SetEvent(redoFault_event);
+    SetEvent(shutdown_event);
 
     trim_running = FALSE;
-    WaitForMultipleObjects(3, threads, TRUE, INFINITE);
+    WaitForMultipleObjects(NUM_THREADS-NUM_FAULT_THREADS, threads, TRUE, INFINITE);
 
     // Close all handles
     for (int i = 0; i < NUM_THREADS; i++) {
@@ -2069,6 +2130,7 @@ full_virtual_memory_test(
     CloseHandle(diskReady_event);
     CloseHandle(modifiedReady_event);
     CloseHandle(redoFault_event);
+    CloseHandle(shutdown_event);
 
     // Stop timer and print result
     QueryPerformanceCounter(&end_time);
