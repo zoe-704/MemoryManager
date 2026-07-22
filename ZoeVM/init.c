@@ -85,11 +85,11 @@ init_pfn_metadata(
         physical_slots[frame].frame_number = frame;
         physical_slots[frame].pte = NULL;
         physical_slots[frame].disc_index = INVALID_DISC_SLOT;
-        physical_slots[frame].list_type = 0;
-        physical_slots[frame].unmap_pending = 0;
-        physical_slots[frame].being_written = 0;
-        physical_slots[frame].accessed = 0;
+        physical_slots[frame].state.list_type = 0;
+        physical_slots[frame].state.being_written = 0;
+        physical_slots[frame].state.accessed = 0;
         physical_slots[frame].owner_thread_id = 0;
+        physical_slots[frame].is_zero = 0;
 
         InitializeListHead(&physical_slots[frame].links);
         InitializeCriticalSectionAndSpinCount(&physical_slots[frame].lock, 0x00FFFFFF);

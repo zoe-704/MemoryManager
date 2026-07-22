@@ -121,21 +121,26 @@ typedef struct _PTE_REGION {
     ULONG64 age_counts[8];      // track number of valid PTEs in region with a certain age
 } PTE_REGION, * PPTE_REGION;
 
+// Struct for PFN states
+typedef union _PFN_STATE {
+    struct {
+        ULONG64 list_type : 2;   // 00 free, 01 active, 10 modified, 11 standby
+        ULONG64 being_written : 1;
+        ULONG64 accessed : 1;
+    };
+    ULONG64 whole;
+} PFN_STATE;
+
 // Struct for our PFNs
 typedef struct _pfn_metadata {
-    LIST_ENTRY links;        // free / active / modified / standby list
+    LIST_ENTRY links;           // free / active / modified / standby list
     CRITICAL_SECTION lock;
-
     ULONG64 frame_number;
     PPTE pte;
     ULONG64 disc_index : MAX_DISC_PTE_BITS;
-
-    ULONG64 list_type : 2;   // 00 free, 01 active, 10 modified, 11 standby
-    ULONG64 unmap_pending : 1;
-    ULONG64 being_written : 1;
-    ULONG64 accessed : 1;
+    volatile PFN_STATE state;   // moved to PFN state for interlocked operations
     ULONG64 owner_thread_id;
-
+    BOOLEAN is_zero;
 } pfn_metadata;
 
 // Struct for disc metadata
@@ -153,10 +158,10 @@ typedef struct _THREAD_RNG_STATE {
 
 // ---- Global state (defined in vm.c) ----
 
-extern ULONG64 NUM_PTE_LOCKS;
+ULONG64 NUM_PTE_LOCKS;
 
-extern LIST_HEAD freeList_head;
-extern LIST_HEAD activeList_head;
+LIST_HEAD freeList_head;
+LIST_HEAD activeList_head;
 extern LIST_HEAD modifiedList_head;
 extern LIST_HEAD standbyList_head;
 
