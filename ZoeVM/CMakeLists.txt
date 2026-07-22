@@ -3,6 +3,6 @@
 #
 
 # Add source to this project's executable.
-add_executable (ZoeVM "vm.c" "init.c" "vm.h")
+add_executable (ZoeVM "vm.c" "init.c" "globals.c" "vm.h")
 
 # TODO: Add tests and install targets if needed.

@@ -28,6 +28,7 @@ init_lists(
     InitializeList(&activeList_head);
     InitializeList(&modifiedList_head);
     InitializeList(&standbyList_head);
+    InitializeList(&zeroList_head);
 }
 
 // Commit only the page(s) of the reserved PFN table that hold this frame's slot.
@@ -162,6 +163,7 @@ init_events(
     // Auto-reset events
     startAge_event = CreateEvent(NULL, FALSE, FALSE, NULL);
     startTrim_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+    startZero_event = CreateEvent(NULL, FALSE, FALSE, NULL);
     diskReady_event = CreateEvent(NULL, FALSE, FALSE, NULL);
     modifiedReady_event = CreateEvent(NULL, FALSE, FALSE, NULL);
     // Manual-reset events

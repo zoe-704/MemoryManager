@@ -12,7 +12,10 @@
 
 //
 // This define enables code that lets us create multiple virtual address
-// mappings to a single physical page.
+// mappings to a single physical page.  We only/need want this if/when we
+// start using reference counts to avoid holding locks while performing
+// pagefile I/Os - because otherwise disallowing this makes it easier to
+// detect and fix unintended failures to unmap virtual addresses properly.
 //
 
 #define SUPPORT_MULTIPLE_VA_TO_SAME_PAGE 1
@@ -36,22 +39,23 @@
 
 #define NUMBER_OF_PHYSICAL_PAGES   (GB(1) / PAGE_SIZE)
 
-#define NUM_DISC_PAGES  (3 * NUMBER_OF_PHYSICAL_PAGES)
+#define NUM_DISC_PAGES  (NUMBER_OF_PHYSICAL_PAGES)
 
 #define MAX_DISC_PTE_BITS 40
 
 #define MAX_DISC_SIZE ((ULONG64) 1 << MAX_DISC_PTE_BITS)
 
-#define MAX_TRIM_PAGES 32
-
-#define LOW_FREE_PAGE_THRESHOLD (NUMBER_OF_PHYSICAL_PAGES / 8)           // start with 1/8 of physical pool as low threshold
+#define INVALID_DISC_SLOT ((1ULL << MAX_DISC_PTE_BITS) - 1)
 
 #define PTES_PER_LOCK 512
 
 #define NUM_FAULT_THREADS 8
-#define NUM_THREADS       12
+#define NUM_THREADS       13
 
-#define INVALID_DISC_SLOT ((1ULL << MAX_DISC_PTE_BITS) - 1)
+#define MAX_TRIM_PAGES 512
+#define MIN_TRIM_BATCH 32
+#define LOW_ZERO_PAGE_THRESHOLD (NUMBER_OF_PHYSICAL_PAGES / 256)
+#define LOW_FREE_PAGE_THRESHOLD (NUMBER_OF_PHYSICAL_PAGES / 64)
 
 #define AGES 8
 
@@ -60,7 +64,7 @@
 
 #define MIN_AGE_INTERVAL_MS 10
 
-#define WRITE_BATCH 16
+#define WRITE_BATCH 64
 
 #define DEBUG 1
 
@@ -112,13 +116,15 @@ typedef struct {
         VALID_PTE hardware;
         TRANSITION_PTE transition;
         DISC_PTE disc;
+        ULONG64 entire_contents;
     };
 } PTE, * PPTE;
 
+// Struct for PTE regions
 typedef struct _PTE_REGION {
     CRITICAL_SECTION lock;
     ULONG64 active_page_count;
-    ULONG64 age_counts[8];      // track number of valid PTEs in region with a certain age
+    ULONG64 age_counts[AGES];   // track number of valid PTEs in region with a certain age
 } PTE_REGION, * PPTE_REGION;
 
 // Struct for PFN states
@@ -138,7 +144,11 @@ typedef struct _pfn_metadata {
     ULONG64 frame_number;
     PPTE pte;
     ULONG64 disc_index : MAX_DISC_PTE_BITS;
-    volatile PFN_STATE state;   // moved to PFN state for interlocked operations
+    // INVARIANT: state may only be read-decided-written while holding the list lock
+    // for the list named by state.list_type (the source list) AND the list lock for
+    // the destination list, held across the whole read-decide-write. Plain accesses
+    // only -- the locks are the mechanism, there is no lock-free path to this field.
+    PFN_STATE state;
     ULONG64 owner_thread_id;
     BOOLEAN is_zero;
 } pfn_metadata;
@@ -150,6 +160,14 @@ typedef struct _DISC_METADATA {
     BOOL isOccupied;
 } DISC_METADATA, * PDISC_METADATA;
 
+// Per-category counter block
+typedef struct _MM_STAT {
+    volatile LONG64 calls;
+    volatile LONG64 ticks;      // raw QPC ticks
+    volatile LONG64 ticks_sub;  // secondary timed region (e.g. memcpy)
+    volatile LONG64 pages;
+} MM_STAT;
+
 typedef struct _THREAD_RNG_STATE {
     ULONG64 s0;
     ULONG64 s1;
@@ -158,46 +176,66 @@ typedef struct _THREAD_RNG_STATE {
 
 // ---- Global state (defined in vm.c) ----
 
-ULONG64 NUM_PTE_LOCKS;
+// Locks
+extern ULONG64 NUM_PTE_LOCKS;
 
-LIST_HEAD freeList_head;
-LIST_HEAD activeList_head;
+// PTE list heads
+extern LIST_HEAD freeList_head;
+extern LIST_HEAD activeList_head;
 extern LIST_HEAD modifiedList_head;
 extern LIST_HEAD standbyList_head;
+extern LIST_HEAD zeroList_head;
 
-extern BOOL trim_running;
+// Events
 extern HANDLE startAge_event;
-extern HANDLE startTrim_event;
-extern HANDLE diskReady_event;
-extern HANDLE modifiedReady_event;
-extern HANDLE redoFault_event;
-extern HANDLE shutdown_event;
+extern HANDLE startTrim_event;      // fault thread tells trimmer to start trimming since pool of available pages is running low
+extern HANDLE startZero_event;      // signal zeroing thread that free list has dirty pages
 
+extern HANDLE diskReady_event;      // signals when disk has free slots
+extern HANDLE modifiedReady_event;  // signals when trimmer has successfully trimmed pages to modified list
 
+extern HANDLE redoFault_event;      // disk writer/trimmer tells fault threads that pages are available or to retry
+extern HANDLE shutdown_event;       // manual-reset: signals all worker threads to exit at end of program
+
+// Page table
 extern PPTE page_table;
 extern PPTE_REGION pte_regions;
 extern ULONG64 num_ptes;
 
-extern PULONG_PTR VA_SPACE;
-extern PVOID temp_va_base;
-extern __declspec(thread) int thread_index;
-extern ULONG_PTR virtual_address_size_in_unsigned_chunks;
-extern PULONG_PTR physical_page_numbers;
-
+// Represents physical memory slots and used as an array of pointers mapping hardware frame number to metadata block
 extern pfn_metadata* physical_slots;
 extern ULONG64 max_frame_number;
 
-extern PDISC_METADATA disc_metadata;
+// Disc
+extern PDISC_METADATA disc_metadata;      // array of nodes, one per disc slot
 extern ULONG64* disc_free_stack;          // array of free slot indices
 extern volatile LONG64 disc_stack_top;    // index of next push slot == current count of free slots
 extern CRITICAL_SECTION disc_stack_lock;  // keep the lock for now (bitmap/lock-free is a later step)
 extern PVOID disc;
-
 extern ULONG64 disc_page_count;
 
+// Counters
 extern volatile LONG64 va_access_count;
 extern volatile LONG64 tick_call;
 extern volatile LONG64 disk_debug[32];
+extern volatile LONG64 hard_fault_count;
+extern volatile LONG64 soft_fault_count;
+
+// Per-category counter block
+static MM_STAT g_trim_stat;
+static MM_STAT g_write_stat;
+static LARGE_INTEGER g_qpc_freq;   // set once via QueryPerformanceFrequency
+
+// Other globals
+extern PULONG_PTR VA_SPACE;
+extern PVOID temp_va_base;
+extern ULONG_PTR virtual_address_size_in_unsigned_chunks;
+extern PULONG_PTR physical_page_numbers;
+
+extern __declspec(thread) int thread_index;
+
+extern ULONG64 last_age_tick;
+extern ULONG64 age_cursor;      // only age_thread touches it for now
 
 // ---- Function prototypes ----
 
@@ -227,9 +265,9 @@ pfn_metadata* get_pfn_from_fn(ULONG64 fn);
 
 // Trim / free-page acquisition
 VOID get_unmap_candidates_and_trim(int* batch_count, INT batch_size);
-pfn_metadata* get_free_page(VOID);
-pfn_metadata* get_pfn_from_standby(CRITICAL_SECTION* my_region);
-pfn_metadata* get_free_pfn(CRITICAL_SECTION* my_region);
+pfn_metadata* get_pfn_from_free(VOID);
+pfn_metadata* get_pfn_from_standby(VOID);
+pfn_metadata* get_free_pfn(VOID);
 
 // PTE setters
 VOID set_pte_valid(PPTE pte, ULONG64 frame_number, ULONG64 age);
@@ -249,6 +287,7 @@ VOID return_disk_free_slots(ULONG64 slot);
 
 // Age lists
 BOOLEAN PTE_WasAccessed(PPTE pte);
+VOID PTE_SetAccessedBit(PPTE pte);
 VOID PTE_ClearAccessedBit(PPTE pte);
 VOID AgeListTick(VOID);
 
@@ -263,6 +302,9 @@ VOID init(ULONG_PTR physical_page_count, PULONG_PTR physical_page_numbers);
 
 // Diagnostics
 VOID print_age_list_histogram(VOID);
+VOID print_statistics(VOID);
+static __forceinline void stat_add(MM_STAT* s, LONG64 t, LONG64 tsub, LONG64 pages);
+static __forceinline LONG64 QPC(void);
 
 // Privilege / setup (init.c)
 BOOL GetPrivilege(VOID);
