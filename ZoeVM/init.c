@@ -389,6 +389,8 @@ setup_program(
     // Init PTE locks
     init_pte_regions();
 
+    QueryPerformanceFrequency(&g_qpc_freq);
+
 #if SUPPORT_MULTIPLE_VA_TO_SAME_PAGE
 
     MEM_EXTENDED_PARAMETER parameter = { 0 };
@@ -412,9 +414,9 @@ setup_program(
         1);
 
     temp_va_base = VirtualAlloc2(
+        GetCurrentProcess(),
         NULL,
-        NULL,
-        (SIZE_T)NUM_THREADS * WRITE_BATCH * PAGE_SIZE,
+        scratch_bytes,
         MEM_RESERVE | MEM_PHYSICAL,
         PAGE_READWRITE,
         &parameter,      // same MemExtendedParameterUserPhysicalHandle as VA_SPACE

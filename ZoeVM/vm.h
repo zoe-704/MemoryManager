@@ -66,6 +66,36 @@
 
 #define WRITE_BATCH 64
 
+#define STAGING_SLOTS        2                                      // [0] scrub and [1] stage
+#define THREAD_SCRATCH_PAGES (STAGING_SLOTS + WRITE_BATCH)
+
+#define SLOT_SCRUB           0
+#define SLOT_STAGE           1
+#define OFF_WRITE            STAGING_SLOTS
+
+#define WORKING_SET_DIVISOR   1     // cold jumps confined to total_pages/this 
+#define HOT_SPOTS             16    // remembered spots per thread
+#define REVISIT_CHANCE        3     // 1-in-N chance of revisiting a hot spot
+#define RECENT_BIAS           2     // 1-in-N of revisits pick from newest 4 
+#define MIN_RUN_PAGES         4
+#define MAX_RUN_PAGES         32
+
+#define LIST_NONE      0   // in transit, or on free/zero
+#define LIST_ACTIVE    1
+#define LIST_MODIFIED  2
+#define LIST_STANDBY   3
+
+#define TEMP_VA_PER_THREAD   512
+#define STAGE_RING_PAGES     512
+#define SLOT_SCRUB           0
+#define OFF_STAGE            1
+#define OFF_WRITE            (OFF_STAGE + STAGE_RING_PAGES)
+#define THREAD_SCRATCH_PAGES (OFF_WRITE + WRITE_BATCH)
+
+#define PERIODIC_INTERVAL_MS   500
+#define TARGET_RUNWAY_S        0.5
+#define MODIFIED_HIGH_WATER    (NUMBER_OF_PHYSICAL_PAGES / 8)
+
 #define DEBUG 1
 
 #if defined(DEBUG)
@@ -130,7 +160,7 @@ typedef struct _PTE_REGION {
 // Struct for PFN states
 typedef union _PFN_STATE {
     struct {
-        ULONG64 list_type : 2;   // 00 free, 01 active, 10 modified, 11 standby
+        ULONG64 list_type : 2; 
         ULONG64 being_written : 1;
         ULONG64 accessed : 1;
     };
@@ -159,6 +189,11 @@ typedef struct _DISC_METADATA {
     ULONG64 index;
     BOOL isOccupied;
 } DISC_METADATA, * PDISC_METADATA;
+
+typedef struct _HOT_SPOT {
+    ULONG64 base;
+    ULONG64 len;
+} HOT_SPOT;
 
 // Per-category counter block
 typedef struct _MM_STAT {
@@ -216,6 +251,7 @@ extern ULONG64 disc_page_count;
 
 // Counters
 extern volatile LONG64 va_access_count;
+extern volatile LONG64 loop_iterations;
 extern volatile LONG64 tick_call;
 extern volatile LONG64 disk_debug[32];
 extern volatile LONG64 hard_fault_count;
@@ -231,11 +267,13 @@ extern PULONG_PTR VA_SPACE;
 extern PVOID temp_va_base;
 extern ULONG_PTR virtual_address_size_in_unsigned_chunks;
 extern PULONG_PTR physical_page_numbers;
-
+extern SIZE_T scratch_bytes;
 extern __declspec(thread) int thread_index;
 
 extern ULONG64 last_age_tick;
 extern ULONG64 age_cursor;      // only age_thread touches it for now
+extern volatile LONG64 g_trim_target;
+
 
 // ---- Function prototypes ----
 

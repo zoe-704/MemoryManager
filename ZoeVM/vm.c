@@ -103,6 +103,82 @@ GetNextRandom(THREAD_RNG_STATE* rng)
     return result;
 }
 
+static __forceinline LONG64 QPC(void) {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
+
+static __forceinline VOID stat_add(MM_STAT* s, LONG64 t, LONG64 tsub, LONG64 pages) {
+    InterlockedIncrement64(&s->calls);
+    InterlockedAdd64(&s->ticks, t);
+    InterlockedAdd64(&s->ticks_sub, tsub);
+    InterlockedAdd64(&s->pages, pages);
+}
+
+static DOUBLE 
+ms(LONG64 ticks) {
+    return (double)ticks * 1000.0 / (double)g_qpc_freq.QuadPart;
+}
+
+static __forceinline PULONG_PTR
+thread_scratch_base(VOID)
+{
+    ASSERT(thread_index >= 0 && thread_index < NUM_THREADS);
+    return (PULONG_PTR)((char*)temp_va_base + (SIZE_T)thread_index * THREAD_SCRATCH_PAGES * PAGE_SIZE);
+}
+
+static __forceinline PULONG_PTR
+thread_scrub_slot(VOID) 
+{ 
+    return (PULONG_PTR)((char*)thread_scratch_base() + (SIZE_T)SLOT_SCRUB * PAGE_SIZE); 
+}
+
+static __forceinline PULONG_PTR
+thread_write_base(VOID) 
+{ 
+    return (PULONG_PTR)((char*)thread_scratch_base() + (SIZE_T)OFF_WRITE * PAGE_SIZE); 
+}
+
+static __forceinline PULONG_PTR
+thread_stage_base(VOID)
+{
+    return (PULONG_PTR)((char*)thread_scratch_base() + (SIZE_T)OFF_STAGE * PAGE_SIZE);
+}
+
+__declspec(thread) ULONG stage_cursor = 0;
+
+// Unmap every slot filled since the last flush, in one call.
+VOID
+stage_ring_flush(VOID)
+{
+    if (stage_cursor == 0) return;
+    if (MapUserPhysicalPages(thread_stage_base(), stage_cursor, NULL) == FALSE) {
+        printf("stage_ring_flush: batch unmap failed, count=%lu, err %lu\n",
+            stage_cursor, GetLastError());
+        DebugBreak();
+    }
+    stage_cursor = 0;
+}
+
+// Claim the next slot, mapping the caller's frame into it.
+static PULONG_PTR
+stage_ring_map(ULONG64 frame_number)
+{
+    if (stage_cursor >= STAGE_RING_PAGES) {
+        stage_ring_flush();
+    }
+    PULONG_PTR slot = (PULONG_PTR)((char*)thread_stage_base() + (SIZE_T)stage_cursor * PAGE_SIZE);
+    ULONG_PTR fn = frame_number;
+    if (MapUserPhysicalPages(slot, 1, &fn) == FALSE) {
+        printf("stage_ring_map: map frame %llX failed, err %lu\n",
+            frame_number, GetLastError());
+        DebugBreak();
+        return NULL;
+    }
+    stage_cursor++;
+    return slot;
+}
 
 // Functions for Linked Lists
 VOID
@@ -263,7 +339,7 @@ get_unmap_candidates_and_trim(int* batch_count, INT batch_size)
     pfn_metadata* unmap_pfns[MAX_TRIM_PAGES];
 
     // For each age, sweep every region
-    for (int age = 7; age > 0 && *batch_count < batch_size; age--) {
+    for (int age = 7; age >= 0 && *batch_count < batch_size; age--) {
         for (ULONG64 i = 0; i < NUM_PTE_LOCKS && *batch_count < batch_size; i++) {
             PPTE_REGION region = &pte_regions[i];
             
@@ -304,15 +380,6 @@ get_unmap_candidates_and_trim(int* batch_count, INT batch_size)
                     continue;
                 }
 
-                // RE-CHECK 2: the frame must actually be on the active list, i.e. the
-                // source list whose lock we hold. Anything else is in transit under
-                // someone else's lock and is not ours to move.
-                if (pfn->state.list_type != 1) {
-                    LeaveCriticalSection(&modifiedList_head.list_lock);
-                    LeaveCriticalSection(&activeList_head.list_lock);
-                    continue;
-                }
-
                 // Disc writer already grabbed the page
                 if (pfn->state.being_written) {
                     LeaveCriticalSection(&modifiedList_head.list_lock);
@@ -323,8 +390,12 @@ get_unmap_candidates_and_trim(int* batch_count, INT batch_size)
                 PULONG_PTR victim_va = get_va_from_pte(pte);
                 // Set pte to transition state
                 set_pte_transition(pte, pfn->frame_number);
+
+                ULONG64 trim_age = fresh.hardware.age;
+                ASSERT(region->age_counts[trim_age] > 0);
+                ASSERT(region->active_page_count > 0);
                 region->active_page_count--;
-                region->age_counts[fresh.hardware.age]--;
+                region->age_counts[trim_age]--;
 
                 // Record VA and PFN in batch arrays
                 unmap_vas[*batch_count] = (PVOID)((ULONG_PTR)victim_va & ~(PAGE_SIZE - 1));
@@ -335,7 +406,7 @@ get_unmap_candidates_and_trim(int* batch_count, INT batch_size)
                 RemoveEntryList(&pfn->links);
                 InterlockedDecrement64(&activeList_head.list_count);
 
-                pfn->state.list_type = 2;
+                pfn->state.list_type = LIST_MODIFIED;
                 InsertTailList(&modifiedList_head.entry, &pfn->links);
                 InterlockedIncrement64(&modifiedList_head.list_count);
 
@@ -429,8 +500,8 @@ get_pfn_from_standby(VOID)
         EnterCriticalSection(&new_pfn->lock);
         PLIST_ENTRY next = standby_entry->Flink;
 
-        //ASSERT(new_pfn->state.list_type == 3);
-        if (new_pfn->state.list_type != 3 || new_pfn->state.being_written) {
+        ASSERT(new_pfn->state.list_type == LIST_STANDBY);
+        if (new_pfn->state.list_type != LIST_STANDBY || new_pfn->state.being_written) {
             LeaveCriticalSection(&new_pfn->lock);
             standby_entry = next;
             continue;                       // not cleanly on standby — skip it
@@ -465,7 +536,7 @@ get_pfn_from_standby(VOID)
 
     // DEBUG: claim under lock so no other path can grab the same frame
     if (result != NULL) {
-        result->state.list_type = 0; // no longer on standby list so in-transit to active
+        result->state.list_type = LIST_NONE; // no longer on standby list so in-transit to active
         ULONG64 tid = GetCurrentThreadId();
         ULONG64 prev = InterlockedCompareExchange64(
             (LONG64 volatile*)&result->owner_thread_id, tid, 0);
@@ -582,7 +653,7 @@ pool_is_empty(VOID)
 VOID
 scrub_frame(pfn_metadata* pfn)
 {
-    PULONG_PTR scratch = (PULONG_PTR)((char*)temp_va_base + ((SIZE_T)thread_index * PAGE_SIZE));
+    PULONG_PTR scratch = thread_scrub_slot();
     if (MapUserPhysicalPages(scratch, 1, &pfn->frame_number) == FALSE) {
         printf("scrub_frame: could not map frame %llX to scratch\n", pfn->frame_number);
         DebugBreak();
@@ -652,28 +723,38 @@ return_disk_free_slots(
     ASSERT(meta->isOccupied == TRUE);
     meta->isOccupied = FALSE;
     ASSERT(disc_stack_top < (LONG64)disc_page_count);   // never overflow the stack
+    BOOL was_empty = (disc_stack_top == 0);
     disc_free_stack[disc_stack_top] = slot;
     disc_stack_top++;
     LeaveCriticalSection(&disc_stack_lock);
-    SetEvent(diskReady_event);
+    if (was_empty) SetEvent(diskReady_event); // ZS maybe a threshold?
 }
 
 // Age stuff
 BOOLEAN
-PTE_WasAccessed(PPTE pte)
+pte_was_accessed(PPTE pte)
 {
     return (BOOLEAN)pte->hardware.accessed;
 }
 
 VOID
-PTE_SetAccessedBit(PPTE pte)
+pte_set_accessed(PPTE pte)
 {
-    pte->hardware.accessed = 1;
+    for (;;) {
+        ULONG64 old = *(volatile ULONG64*)pte;
+        PTE s; *(ULONG64*)&s = old;
+        if (s.hardware.valid != 1 || s.hardware.accessed == 1) break;
+        PTE upd = s;
+        upd.hardware.accessed = 1;
+        if ((ULONG64)InterlockedCompareExchange64((LONG64*)pte,
+            *(LONG64*)&upd,
+            (LONG64)old) == old) break;
+    }
     return;
 }
 
 VOID
-PTE_ClearAccessedBit(PPTE pte) 
+pte_clear_accessed(PPTE pte) 
 {
     pte->hardware.accessed = 0;
     return;
@@ -706,21 +787,41 @@ AgeListTick(VOID)
         for (ULONG64 j = start; j < end; j++) {
             PPTE pte = page_table + j;
 
+            ULONG64 old = *(volatile ULONG64*)pte;
             PTE snapshot;
-            *(ULONG64*)&snapshot = *(volatile ULONG64*)pte;
-            if (snapshot.hardware.valid != 1) continue; // age only valid PTEss
+            *(ULONG64*)&snapshot = old;
+            if (snapshot.hardware.valid != 1) continue; // age only valid PTEs
 
+            PTE updated = snapshot;
+            ULONG64 from_age = snapshot.hardware.age;
+            ULONG64 to_age;
+
+            // Touched: decay one step toward hottest
             if (snapshot.hardware.accessed) {
-                snapshot.hardware.accessed = 0;         // touched and reset but keep age
+                //to_age = (from_age > 0) ? from_age - 1 : 0;
+                to_age = 0;
+                updated.hardware.accessed = 0;
             }
-            else if (snapshot.hardware.age < 7) {
-                region->age_counts[snapshot.hardware.age]--;
-                snapshot.hardware.age++;                // untouched and age up
-                region->age_counts[snapshot.hardware.age]++;
+            // Untouched: age up
+            else if (from_age < 7) {
+                to_age = from_age + 1;
             }
-            else continue;
+            else continue;   // cold and already maxed so nothing to do
 
-            *(volatile ULONG64*)pte = *(ULONG64*)&snapshot;
+            updated.hardware.age = to_age;
+
+            // Publish first and buckets follow only if successful
+            if ((ULONG64)InterlockedCompareExchange64((LONG64*)pte,
+                *(LONG64*)&updated,
+                (LONG64)old) != old) {
+                continue;   // someone changed the PTE so buckets untouched, retry next tick
+            }
+
+            if (to_age != from_age) {
+                ASSERT(region->age_counts[from_age] > 0);
+                region->age_counts[from_age]--;
+                region->age_counts[to_age]++;
+            }
         }
         LeaveCriticalSection(&region->lock);
     }
@@ -731,16 +832,18 @@ print_age_list_histogram (VOID)
 {
     ULONG64 buckets[AGES] = { 0 };
     ULONG64 total_active = 0;
+    ULONG64 sum_active = 0;
     for (ULONG64 i = 0; i < NUM_PTE_LOCKS; i++) {
         EnterCriticalSection(&pte_regions[i].lock);
-        for (int age = 1; age <= 7; age++) {
+        for (int age = 0; age <= 7; age++) {
             buckets[age] += pte_regions[i].age_counts[age];
         }
+        sum_active += pte_regions[i].active_page_count;
         LeaveCriticalSection(&pte_regions[i].lock);
     }
 
     printf("\n---------- AGE LIST HISTOGRAM ----------\n");
-    for (int age = 1; age <= 7; age++) {
+    for (int age = 0; age <= 7; age++) {
         printf("  age %d: %6llu pages\n", age, buckets[age]);
         total_active += buckets[age];
     }
@@ -750,7 +853,14 @@ print_age_list_histogram (VOID)
     printf("  active list        : %6llu\n", activeList_head.list_count);
     printf("  modified list      : %6llu\n", modifiedList_head.list_count);
     printf("  standby list       : %6llu\n", standbyList_head.list_count);
+    printf("  disc stack top     : %6lld / %6llu\n", disc_stack_top, disc_page_count);
     printf("  tick call          : %6llu\n", tick_call);
+    printf("  sum active_page_count: %6llu  (should equal total in age lists)\n", sum_active);
+    printf("  list totals: %6llu  (should equal %u)\n",
+        freeList_head.list_count + zeroList_head.list_count +
+        activeList_head.list_count + modifiedList_head.list_count +
+        standbyList_head.list_count,
+        NUMBER_OF_PHYSICAL_PAGES);
     printf("-----------------------------------------\n\n");
 }
 
@@ -776,23 +886,6 @@ print_statistics(VOID)
         printf("  SOFT:     %6llu  (%.1f%%)\n", soft, 100.0 * soft / faults);
     }
     printf("--------------------------------\n\n");
-}
-
-static __forceinline LONG64 QPC(void) {
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    return t.QuadPart;
-}
-
-static __forceinline VOID stat_add(MM_STAT* s, LONG64 t, LONG64 tsub, LONG64 pages) {
-    InterlockedIncrement64(&s->calls);
-    InterlockedAdd64(&s->ticks, t);
-    InterlockedAdd64(&s->ticks_sub, tsub);
-    InterlockedAdd64(&s->pages, pages);
-}
-
-static DOUBLE ms(LONG64 ticks) {
-    return (double)ticks * 1000.0 / (double)g_qpc_freq.QuadPart;
 }
 
 VOID print_mm_stats(void) {
@@ -836,24 +929,24 @@ handle_soft_fault(PVOID arbitrary_va)
     pfn_metadata* pfn = get_pfn_from_fn(frame);
 
     // Read list_type to choose the lock
-    PFN_STATE s0; s0.whole = pfn->state.whole;
-    ULONG64 lt = s0.list_type;
-    if (lt != 2 && lt != 3) {          // only modified/standby are rescuable here
+    PFN_STATE s; 
+    s.whole = pfn->state.whole;
+    ULONG64 lt = s.list_type;
+    if (lt != LIST_MODIFIED && lt != LIST_STANDBY) {          // only modified/standby are rescuable here
         LeaveCriticalSection(region);
         return FALSE;
     }
-    PLIST_HEAD list_head = (lt == 3) ? &standbyList_head : &modifiedList_head;
+    PLIST_HEAD list_head = (lt == LIST_STANDBY) ? &standbyList_head : &modifiedList_head;
     EnterCriticalSection(&list_head->list_lock);
 
     // Reread under lock
-    PFN_STATE s; s.whole = pfn->state.whole;
+    s.whole = pfn->state.whole;
     if (s.list_type != lt) {
         // Frame moved lists between our read and the lock so bail
         LeaveCriticalSection(&list_head->list_lock);
         LeaveCriticalSection(region);
         return FALSE;
     }
-
     
     // Normal rescue from disc
     if (s.being_written) {
@@ -864,7 +957,7 @@ handle_soft_fault(PVOID arbitrary_va)
     }
 
     // Set invalid disk slot if from standby list
-    if (lt == 3) {
+    if (lt == LIST_STANDBY) {
         return_disk_free_slots(pfn->disc_index); // clears disc_slot_owner
         InterlockedIncrement64(&disk_debug[2]);
     }
@@ -889,7 +982,7 @@ handle_soft_fault(PVOID arbitrary_va)
     EnterCriticalSection(&pfn->lock);
 
     // Edit PFN
-    pfn->state.list_type = 1;
+    pfn->state.list_type = LIST_ACTIVE;
     pfn->pte = pte; // ZSPFN
     InsertTailList(&activeList_head.entry, &pfn->links);
     // Edit PTE
@@ -899,9 +992,9 @@ handle_soft_fault(PVOID arbitrary_va)
     region_struct->age_counts[1]++;
     LeaveCriticalSection(&activeList_head.list_lock);
 
+    InterlockedIncrement64(&soft_fault_count);
     LeaveCriticalSection(&pfn->lock);
     LeaveCriticalSection(region);
-    InterlockedIncrement64(&soft_fault_count);
     return TRUE;
 }
 // ZS map neighbors in mapphysicalpages call to increase iefficiency significantly
@@ -965,6 +1058,8 @@ handle_hard_fault(PVOID arbitrary_va)
             return FALSE;
         }
 
+        stage_ring_flush();
+
         HANDLE waits[2] = { redoFault_event, shutdown_event };
         if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) return FALSE;
 
@@ -979,7 +1074,7 @@ handle_hard_fault(PVOID arbitrary_va)
             // Another thread has restored this page so give frame back to free list
             EnterCriticalSection(&freeList_head.list_lock);
             // ZS batch write this
-            new_pfn->state.list_type = 0;
+            new_pfn->state.list_type = LIST_NONE;
             new_pfn->disc_index = INVALID_DISC_SLOT;
             new_pfn->owner_thread_id = 0; 
             InsertHeadList(&freeList_head.entry, &new_pfn->links);
@@ -993,7 +1088,7 @@ handle_hard_fault(PVOID arbitrary_va)
             // Return frame like above 
             EnterCriticalSection(&freeList_head.list_lock);
             // ZS batch write this
-            new_pfn->state.list_type = 0;
+            new_pfn->state.list_type = LIST_NONE;
             new_pfn->disc_index = INVALID_DISC_SLOT;
             new_pfn->owner_thread_id = 0;
             InsertHeadList(&freeList_head.entry, &new_pfn->links);
@@ -1003,65 +1098,60 @@ handle_hard_fault(PVOID arbitrary_va)
         }
         BOOL from_disc = pte->disc.disc;
         ULONG64 old_disc_slot = from_disc ? pte->disc.disc_index : -1;
-
         PULONG_PTR page_aligned_va = (PVOID)((ULONG_PTR)arbitrary_va & ~(PAGE_SIZE - 1));
-        PULONG_PTR temp_va = (PULONG_PTR)((char*)temp_va_base + ((SIZE_T)thread_index * WRITE_BATCH * PAGE_SIZE));
 
-        // Step 3: clear the frame
-        // Only zero a frame we're NOT about to overwrite from disc.
-        // Disc restores memcpy the full PAGE_SIZE, so pre-zeroing is dead work.
-        if (!from_disc && !new_pfn->is_zero) {
-            scrub_frame(new_pfn);
-        }
-
-        // STEP 4: restore from disk if needed
+        // STEP 3: restore from disc via the private staging slot, before exposing at the real VA
         if (from_disc) {
-            // Map the frame to a per-thread scratch VA
-            if (MapUserPhysicalPages(temp_va, 1, &new_pfn->frame_number) == FALSE) {
-                printf("could not map frame %llX to temp_va\n", new_pfn->frame_number);
+            PULONG_PTR temp_va = stage_ring_map(new_pfn->frame_number);
+            if (temp_va == NULL) {
                 LeaveCriticalSection(region);
-                DebugBreak();
                 return FALSE;
             }
 
-            // Get data from disc and copy to new page
-            VOID* disc_address = (char*)disc + (old_disc_slot * PAGE_SIZE);
-            memcpy(temp_va, disc_address, PAGE_SIZE);
-            
+            memcpy(temp_va, (char*)disc + (old_disc_slot * PAGE_SIZE), PAGE_SIZE);
+
             ULONG_PTR first = *(PULONG_PTR)temp_va;
             if (first != 0 && (first & ~(PAGE_SIZE - 1)) != (ULONG_PTR)page_aligned_va) {
-                printf("hard fault: slot %llu holds data for VA %p, expected %p\n", old_disc_slot, (PVOID)first, page_aligned_va);
+                printf("hard fault: slot %llu holds data for VA %p, expected %p\n",
+                    old_disc_slot, (PVOID)first, page_aligned_va);
                 DebugBreak();
             }
-
-            // Unmap from temp before remapping elsewhere, frame can't be mapped at 2 VAs
+            /*
             if (MapUserPhysicalPages(temp_va, 1, NULL) == FALSE) {
-                printf("could not unmap frame %llX from temp_va\n", new_pfn->frame_number);
+                printf("could not unmap frame %llX from temp_va, err %lu\n",
+                    new_pfn->frame_number, GetLastError());
                 LeaveCriticalSection(region);
                 DebugBreak();
                 return FALSE;
-            }
+            }*/
 
-            return_disk_free_slots(old_disc_slot); // Free up slot (clears disc_slot_owner)
+            return_disk_free_slots(old_disc_slot);
             InterlockedIncrement64(&disk_debug[3]);
         }
 
-        // Expose at the real VA 
+        // STEP 4: expose at the real VA
         if (MapUserPhysicalPages(page_aligned_va, 1, &new_pfn->frame_number) == FALSE) {
-            printf("could not map VA %p to page %llX\n", arbitrary_va, new_pfn->frame_number);
+            printf("could not map VA %p to frame %llX, err %lu\n",
+                arbitrary_va, new_pfn->frame_number, GetLastError());
             LeaveCriticalSection(region);
             DebugBreak();
             return FALSE;
         }
+
+        // Only zero a frame we did NOT just overwrite from disc
+        if (!from_disc && !new_pfn->is_zero) {
+            memset(page_aligned_va, 0, PAGE_SIZE);
+        }
+
 #if DEBUG
         //validate_page_contents(page_aligned_va, "1695");
-#endif DEBUG
+#endif
 
         // STEP 5: set to active state and update metadata
         // Insert onto active list and set as valid
         EnterCriticalSection(&activeList_head.list_lock);
         new_pfn->state.being_written = 0;
-        new_pfn->state.list_type = 1;
+        new_pfn->state.list_type = LIST_ACTIVE;
         new_pfn->is_zero = 0;
         new_pfn->pte = pte;
         new_pfn->owner_thread_id = 0;  
@@ -1072,10 +1162,10 @@ handle_hard_fault(PVOID arbitrary_va)
         region_struct->active_page_count++;
         region_struct->age_counts[1]++;
 
+        InterlockedIncrement64(&hard_fault_count);
         LeaveCriticalSection(&activeList_head.list_lock);
         LeaveCriticalSection(region);
     }
-    InterlockedIncrement64(&hard_fault_count);
     return TRUE;
 }
 
@@ -1083,7 +1173,7 @@ handle_hard_fault(PVOID arbitrary_va)
 VOID
 write_modified_list(VOID) 
 {
-    PULONG_PTR batch_base = (PULONG_PTR)((char*)temp_va_base + ((SIZE_T)thread_index * WRITE_BATCH * PAGE_SIZE));
+    PULONG_PTR batch_base = thread_write_base();
     ULONG_PTR frames[WRITE_BATCH];
     pfn_metadata* pfns[WRITE_BATCH];
     ULONG64 slots[WRITE_BATCH];
@@ -1106,14 +1196,14 @@ write_modified_list(VOID)
 
         // Another thread owns it for write so restore
         if (pfn->state.being_written) {
-            pfn->state.list_type = 2;
+            pfn->state.list_type = LIST_MODIFIED;
             InsertTailList(&modifiedList_head.entry, &pfn->links);
             InterlockedIncrement64(&modifiedList_head.list_count);
             LeaveCriticalSection(&modifiedList_head.list_lock);
-            continue;
+            continue; // ZS break or continue?
         }
 
-        ASSERT(pfn->state.list_type == 2);
+        ASSERT(pfn->state.list_type == LIST_MODIFIED);
         ASSERT(pfn->pte != NULL);
 
         pfn->state.being_written = 1;
@@ -1150,10 +1240,12 @@ write_modified_list(VOID)
             DebugBreak();
         }
         LONG64 t_map = QPC() - t0;
+        LONG64 t_copy_total = 0;
 
         // Create c amount of copies
         for (ULONG i = 0; i < count; i++) {
-            PFN_STATE s; s.whole = pfns[i]->state.whole;
+            PFN_STATE s; 
+            s.whole = pfns[i]->state.whole;
             if (s.being_written == 0) { 
                 // Rescued during collection so mark slot for return after unmap
                 slots[i] = (ULONG64)-1;
@@ -1165,14 +1257,14 @@ write_modified_list(VOID)
             PULONG_PTR src = (PULONG_PTR)((char*)batch_base + (i * PAGE_SIZE));
             LONG64 t1 = QPC();
             memcpy((BYTE*)disc + slots[i] * PAGE_SIZE, src, PAGE_SIZE);
-            LONG64 t_copy = QPC() - t1;
+            t_copy_total += QPC() - t1;
         }
         // Batch unmap
         if (MapUserPhysicalPages(batch_base, count, NULL) == FALSE) {
             printf("batch map failed, count=%lu\n", count);
             DebugBreak();
         }
-
+        stat_add(&g_write_stat, t_map, t_copy_total, count);
         // Step 3: commit to standby and clean up rescued
         for (ULONG i = 0; i < count; i++) {
             if (slots[i] == (ULONG64)-1) continue; // rescued in step 2 so slot already dealt with
@@ -1188,7 +1280,7 @@ write_modified_list(VOID)
                 continue;
             }
             pfns[i]->state.being_written = 0;
-            pfns[i]->state.list_type = 3;
+            pfns[i]->state.list_type = LIST_STANDBY;
             InsertTailList(&standbyList_head.entry, &pfns[i]->links);
             InterlockedIncrement64(&standbyList_head.list_count);
             LeaveCriticalSection(&standbyList_head.list_lock);
@@ -1199,11 +1291,10 @@ write_modified_list(VOID)
 }
 
 DWORD WINAPI
-page_fault_thread(
+page_fault_thread_random(
     PVOID parameter
 ) {
     thread_index = (int)(ULONG_PTR)parameter;
-    unsigned i;
     // Each thread gets its own local rng state seeded from timestamp
     THREAD_RNG_STATE thread_rng;
     SeedRng(&thread_rng);
@@ -1217,16 +1308,18 @@ page_fault_thread(
 
     // Start timer
     QueryPerformanceFrequency(&frequency);
-    printf("Page fault thread %i: starting virtual memory simulation workload...\n", thread_index);
+    printf("Page fault thread random %i: starting virtual memory simulation workload...\n", thread_index);
     QueryPerformanceCounter(&start_time);
 
-    BOOL page_faulted = FALSE;
+    unsigned i = 0;
+    BOOL page_faulted;
     BOOL fault_resolution = TRUE;
     PULONG_PTR arbitrary_va;
+    ULONG64 runtime = (1 * (MB(1) / 1));
 
     // Now perform random accesses.
-    for (i = 1; i <= (100 * MB(1) / 1); i += 1) {
-        InterlockedIncrement64(&va_access_count);
+    while (i < runtime) {
+        InterlockedIncrement64(&loop_iterations);
         page_faulted = FALSE;
 
         // If arbitrary VA is empty or successfully stamped, generate next arbitrary VA
@@ -1236,6 +1329,7 @@ page_fault_thread(
 
             random_number &= ~0x7;
             arbitrary_va = VA_SPACE + random_number;
+            fault_resolution = FALSE;
         }
 
         // Some VAs can map to the same page and will not fault
@@ -1291,13 +1385,19 @@ page_fault_thread(
         }
         // Fault does not occur
         else {
-            fault_resolution = TRUE;
+            InterlockedIncrement64(&va_access_count);
             PPTE pte = get_pte_from_va(arbitrary_va);
-            // Change their list
-            // Reset the age list
+            pte_set_accessed(pte);
+            fault_resolution = TRUE;
         }
-        if (i % 100000 == 0) printf(". ");
+        if (i > 0 && i % 10000 == 0) {
+            printf(". ");
+            fflush(stdout);
+        }
+        i++;
     }
+
+    stage_ring_flush();
 
     // Stop timer and print result
     QueryPerformanceCounter(&end_time);
@@ -1314,7 +1414,201 @@ page_fault_thread(
     return 0;
 }
 
-// thread 3
+DWORD WINAPI
+page_fault_thread_nonrandom(
+    PVOID parameter
+) {
+    thread_index = (int)(ULONG_PTR)parameter;
+    THREAD_RNG_STATE thread_rng;
+    SeedRng(&thread_rng);
+
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER start_time;
+    LARGE_INTEGER end_time;
+    double elapsed_ms;
+
+    QueryPerformanceFrequency(&frequency);
+    printf("Page fault thread nonrandom %i: starting virtual memory simulation workload...\n", thread_index);
+    QueryPerformanceCounter(&start_time);
+
+    //
+    // Locality state.
+    //
+    ULONG64 total_pages = virtual_address_size_in_unsigned_chunks / (PAGE_SIZE / sizeof(ULONG_PTR));
+
+    // Bound the working set so trimmed pages are still on standby when revisited.
+    ULONG64 cold_span = total_pages / WORKING_SET_DIVISOR;
+    if (cold_span == 0) {
+        cold_span = total_pages;
+    }
+
+    // Each thread gets its own slice so threads don't serialize on the same region locks.
+    ULONG64 slice = cold_span / NUM_FAULT_THREADS;
+    ULONG64 slice_lo = (ULONG64)thread_index * slice;
+    if (slice == 0) {
+        slice = cold_span;
+        slice_lo = 0;
+    }
+
+    HOT_SPOT hot[HOT_SPOTS];
+    for (int h = 0; h < HOT_SPOTS; h++) {
+        hot[h].base = 0;
+        hot[h].len = 0;
+    }
+    int hot_next = 0;
+    int hot_count = 0;
+
+    ULONG64 base_page = slice_lo + (GetNextRandom(&thread_rng) % slice);
+    ULONG64 cur_page = base_page;
+    ULONG64 run_left = 0;
+
+    unsigned i = 0;
+    BOOL page_faulted;
+    BOOL fault_resolution = TRUE;
+    PULONG_PTR arbitrary_va = NULL;
+    ULONG64 runtime = (1 * (MB(1) / 1));
+
+    while (i < runtime) {
+        InterlockedIncrement64(&loop_iterations);
+        page_faulted = FALSE;
+
+        //
+        // Only pick a new VA when the previous one was fully resolved.
+        //
+        if (fault_resolution == TRUE) {
+
+            if (run_left == 0) {
+                ULONG64 r = GetNextRandom(&thread_rng);
+
+                if (hot_count > 0 && (r % REVISIT_CHANCE) == 0) {
+                    //
+                    // REVISIT: re-touch the same base AND length as before, so those
+                    // pages are still valid or on modified/standby -- soft faults.
+                    //
+                    int pick;
+                    if ((GetNextRandom(&thread_rng) % RECENT_BIAS) == 0) {
+                        int recent = (hot_count < 4) ? hot_count : 4;
+                        int back = 1 + (int)(GetNextRandom(&thread_rng) % recent);
+                        pick = (hot_next - back + HOT_SPOTS) % HOT_SPOTS;
+                    }
+                    else {
+                        pick = (int)(GetNextRandom(&thread_rng) % hot_count);
+                    }
+                    base_page = hot[pick].base;
+                    run_left = hot[pick].len;
+                }
+                else {
+                    //
+                    // COLD JUMP: new location inside this thread's bounded slice.
+                    //
+                    base_page = slice_lo + (GetNextRandom(&thread_rng) % slice);
+                    run_left = MIN_RUN_PAGES +
+                        (GetNextRandom(&thread_rng) % (MAX_RUN_PAGES - MIN_RUN_PAGES));
+                }
+
+                // Clamp to the end of the VA space.
+                if (base_page >= total_pages) {
+                    base_page = 0;
+                }
+                if (base_page + run_left > total_pages) {
+                    run_left = total_pages - base_page;
+                    if (run_left == 0) {
+                        base_page = 0;
+                        run_left = MIN_RUN_PAGES;
+                    }
+                }
+
+                // Stamp as most recent so repeated revisits keep a small set hot.
+                hot[hot_next].base = base_page;
+                hot[hot_next].len = run_left;
+                hot_next = (hot_next + 1) % HOT_SPOTS;
+                if (hot_count < HOT_SPOTS) {
+                    hot_count++;
+                }
+
+                cur_page = base_page;
+            }
+
+            arbitrary_va = (PULONG_PTR)((PUCHAR)VA_SPACE + (cur_page * PAGE_SIZE));
+            fault_resolution = FALSE;
+        }
+
+        page_faulted = FALSE;
+
+        __try {
+            ULONG_PTR current_value = *(volatile PULONG_PTR)arbitrary_va;
+
+            if (current_value != 0 && current_value != (ULONG_PTR)arbitrary_va) {
+                printf("CRITICAL: Data corruption! VA %p was overwritten with %p\n",
+                    arbitrary_va, (PVOID)current_value);
+                DebugBreak();
+            }
+
+            *(PULONG_PTR)arbitrary_va = (ULONG_PTR)arbitrary_va;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            page_faulted = TRUE;
+        }
+
+        PPTE pte = get_pte_from_va(arbitrary_va);
+
+        if (page_faulted) {
+            // Redo this iteration against the SAME va but do not advance the run
+            i--;
+            fault_resolution = FALSE;
+
+            PTE snap;
+            *(ULONG64*)&snap = *(volatile ULONG64*)pte;
+
+            if (snap.hardware.valid == 1) {
+                continue;
+            }
+            else if (snap.transition.valid == 0 && snap.transition.transition == 1) {
+                if (!handle_soft_fault(arbitrary_va)) {
+                    fault_resolution = FALSE;
+                }
+            }
+            else if (snap.hardware.valid == 0 && snap.transition.transition == 0) {
+                if (!handle_hard_fault(arbitrary_va)) {
+                    fault_resolution = FALSE;
+                }
+            }
+            else {
+                continue;
+            }
+        }
+        else {
+            InterlockedIncrement64(&va_access_count);
+            PPTE pte = get_pte_from_va(arbitrary_va);
+            pte_set_accessed(pte);
+            // Access succeeded so advance within the run
+            cur_page++;
+            run_left--;
+            fault_resolution = TRUE;
+
+        }
+        if (i > 0 && i % 100000 == 0) {
+            printf(". ");
+            fflush(stdout);
+        }
+        i++;
+    }
+    stage_ring_flush();
+
+    QueryPerformanceCounter(&end_time);
+    elapsed_ms = (double)(end_time.QuadPart - start_time.QuadPart) * 1000.0 / frequency.QuadPart;
+
+    printf("\n==============================================\n");
+    printf("WORKLOAD COMPLETE\n");
+    printf("Thread execution time: %.2f ms\n", elapsed_ms);
+    printf("Thread access iterations: %u\n", i);
+    printf("==============================================\n\n");
+
+    printf("page_fault_thread : finished accessing %u virtual addresses\n", i);
+    return 0;
+}
+
+// thread type 2
 DWORD WINAPI
 trim_thread(
     PVOID parameter
@@ -1341,35 +1635,18 @@ trim_thread(
         if (zeroList_head.list_count < LOW_ZERO_PAGE_THRESHOLD) {
             SetEvent(startZero_event);
         }
-        // Only trim if running low on pages that we can reclaim
-        ULONG64 reclaimable = freeList_head.list_count + standbyList_head.list_count;
-        if (reclaimable < LOW_FREE_PAGE_THRESHOLD) {
-            ULONG64 now = GetTickCount64();
-            if (now - last_age_tick >= MIN_AGE_INTERVAL_MS) {
-                last_age_tick = now;
-                SetEvent(startAge_event);
-            }
-            
-            // Dynamic batch: trim enough to overshoot threshold
-            ULONG64 target = LOW_FREE_PAGE_THRESHOLD + (LOW_FREE_PAGE_THRESHOLD / 2);
-            ULONG64 batch = (reclaimable < target) ? (target - reclaimable) : MIN_TRIM_BATCH;
-            if (batch < MIN_TRIM_BATCH) batch = MIN_TRIM_BATCH;
-            if (batch > MAX_TRIM_PAGES)  batch = MAX_TRIM_PAGES;
-
-            count = 0;
-            get_unmap_candidates_and_trim(&count, MAX_TRIM_PAGES);
-        
-            if (count > 0 || modifiedList_head.list_count > 0) { // ZS add threshold?
-                SetEvent(modifiedReady_event);  // wake up disk thread if there are trimmed pages
-            }
-            // Re-arm if still under pressure, regardless of whether we trimmed
-            ULONG64 now_reclaimable = freeList_head.list_count + standbyList_head.list_count;
-            if (now_reclaimable < LOW_FREE_PAGE_THRESHOLD && WaitForSingleObject(shutdown_event, 0) != WAIT_OBJECT_0) {
-                SetEvent(startTrim_event);
-            }
+        if (modifiedList_head.list_count > MODIFIED_HIGH_WATER) {
+            SetEvent(modifiedReady_event);
+            continue;
         }
-        else {
-            SetEvent(redoFault_event);
+        LONG64 batch = InterlockedOr64(&g_trim_target, 0);
+        if (batch <= 0) batch = MIN_TRIM_BATCH;
+
+        count = 0;
+        get_unmap_candidates_and_trim(&count, MAX_TRIM_PAGES);
+
+        if (count > 0 || modifiedList_head.list_count > 0) {    // ZS add threshold?
+            SetEvent(modifiedReady_event);                      // wake up disk thread if there are trimmed pages
         }
     }
 
@@ -1386,7 +1663,7 @@ trim_thread(
     return 0;
 }
 
-// thread 4
+// thread type 3
 DWORD WINAPI
 disc_thread(
     PVOID parameter
@@ -1411,8 +1688,11 @@ disc_thread(
         if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) break;
         if (WaitForSingleObject(shutdown_event, 0) == WAIT_OBJECT_0) break;
 
-
-        write_modified_list();
+        // ZS ts is not dynamic
+        while (modifiedList_head.list_count > 0) {
+            if (WaitForSingleObject(shutdown_event, 0) == WAIT_OBJECT_0) break;
+            write_modified_list();
+        }
     }
 
     // Drain anything remaining before exit
@@ -1431,7 +1711,7 @@ disc_thread(
     return 0;
 }
 
-// thread 5: aging (pressure-driven)
+// thread type 4: aging (pressure-driven)
 DWORD WINAPI
 age_thread(
     PVOID parameter
@@ -1487,8 +1767,62 @@ periodic_thread(PVOID parameter)
     printf("Periodic thread %i: starting virtual memory simulation workload...\n", thread_index);
     QueryPerformanceCounter(&start_time);
 
-    // Only waits for shutdown
-    WaitForSingleObject(shutdown_event, INFINITE);
+
+    LONG64 prev_hard = 0, prev_soft = 0, prev_trimmed = 0, prev_written = 0;
+    ULONG64 prev_tick = GetTickCount64();
+    ULONG64 t_start = prev_tick;
+    ULONG64 t0 = GetTickCount64();
+
+    for (;;) {
+        if (WaitForSingleObject(shutdown_event, 1000) == WAIT_OBJECT_0) break;
+
+        ULONG64 now = GetTickCount64();
+        ULONG64 dt_ms = now - prev_tick;
+        if (dt_ms == 0) continue;
+        prev_tick = now;
+
+        LONG64 hard = InterlockedOr64(&hard_fault_count, 0);
+        LONG64 soft = InterlockedOr64(&soft_fault_count, 0);
+        LONG64 trimmed = InterlockedOr64(&g_trim_stat.pages, 0);
+        LONG64 written = InterlockedOr64(&g_write_stat.pages, 0);
+
+        double consume_rate = (double)(hard - prev_hard) * 1000.0 / dt_ms;
+        double trim_rate = (double)(trimmed - prev_trimmed) * 1000.0 / dt_ms;
+        double write_rate = (double)(written - prev_written) * 1000.0 / dt_ms;
+        double soft_rate = (double)(soft - prev_soft) * 1000.0 / dt_ms;
+
+        prev_hard = hard; 
+        prev_soft = soft;
+        prev_trimmed = trimmed; 
+        prev_written = written;
+
+        ULONG64 supply = freeList_head.list_count
+            + zeroList_head.list_count
+            + standbyList_head.list_count;
+        double runway_s = (consume_rate > 0.0) ? (double)supply / consume_rate : 1e9;
+
+        // Dynamic trimming and writing signaling
+        ULONG64 want = (ULONG64)(consume_rate * TARGET_RUNWAY_S);
+        if (want < MIN_TRIM_BATCH) want = MIN_TRIM_BATCH;
+        if (want > MAX_TRIM_PAGES) want = MAX_TRIM_PAGES;
+        InterlockedExchange64(&g_trim_target, (LONG64)want);
+
+        if (runway_s < TARGET_RUNWAY_S) SetEvent(startTrim_event);
+        if (modifiedList_head.list_count > MODIFIED_HIGH_WATER) SetEvent(modifiedReady_event);
+        if (zeroList_head.list_count < LOW_ZERO_PAGE_THRESHOLD) SetEvent(startZero_event);
+        SetEvent(startAge_event);
+
+#if DEBUG
+        printf("\n[%6llums] act=%6lld mod=%6lld stby=%6lld free=%5lld zero=%5lld disc=%6lld "
+            "| consume=%7.0f trim=%7.0f write=%7.0f soft=%7.0f | runway=%.2fs\n",
+            now - t_start,
+            activeList_head.list_count, modifiedList_head.list_count,
+            standbyList_head.list_count, freeList_head.list_count,
+            zeroList_head.list_count, disc_stack_top,
+            consume_rate, trim_rate, write_rate, soft_rate,
+            runway_s);
+    }
+#endif
 
     // Stop timer and print result
     QueryPerformanceCounter(&end_time);
@@ -1521,7 +1855,7 @@ zero_thread(PVOID parameter)
 
     // Zero thread's write region in the scratch slab (WRITE_BATCH pages) but not the 1-page scrub slot
     // Requires this thread_index to own a WRITE_BATCH-page write region in temp_va_base
-    PULONG_PTR batch_base = (PULONG_PTR)((char*)temp_va_base + ((SIZE_T)thread_index * WRITE_BATCH * PAGE_SIZE));
+    PULONG_PTR batch_base = thread_write_base();
 
     for (;;) {
         HANDLE waits[2] = { startZero_event, shutdown_event };
@@ -1529,32 +1863,107 @@ zero_thread(PVOID parameter)
         if (WaitForSingleObject(shutdown_event, 0) == WAIT_OBJECT_0) break;
 
         for (;;) {
+            if (WaitForSingleObject(shutdown_event, 0) == WAIT_OBJECT_0) break;
+
             ULONG_PTR frames[WRITE_BATCH];
             pfn_metadata* pfns[WRITE_BATCH];
             ULONG count = 0;
 
-            // Get pfn off of free list
+            // Step 1: claim up to WRITE_BATCH frames off of free list
             EnterCriticalSection(&freeList_head.list_lock);
-            if (IsListEmpty(&freeList_head.entry)) {
-                LeaveCriticalSection(&freeList_head.list_lock);
-                break;
+            while (count < WRITE_BATCH && !IsListEmpty(&freeList_head.entry)) {
+                PLIST_ENTRY free_e = RemoveHeadList(&freeList_head.entry);
+                InterlockedDecrement64(&freeList_head.list_count);
+                pfn_metadata* pfn = get_pfn_from_PListEntry(free_e);
+                // Claim ownership
+                pfns[count] = pfn;
+                frames[count] = pfn->frame_number;
+                count++;
             }
-            PLIST_ENTRY e = RemoveHeadList(&freeList_head.entry);
-            InterlockedDecrement64(&freeList_head.list_count);
             LeaveCriticalSection(&freeList_head.list_lock);
-            pfn_metadata* pfn = get_pfn_from_PListEntry(e);
 
-            // Map to thread's scratch slot, memset, unmap
-            if (!pfn->is_zero) {
-                scrub_frame(pfn);
-                pfn->is_zero = 1;
+            // Step 2: claim frames off of standby list via rescue-to-disc protocol
+            EnterCriticalSection(&standbyList_head.list_lock);
+            PLIST_ENTRY standby_e = standbyList_head.entry.Flink;
+            while (count < WRITE_BATCH && standby_e != &standbyList_head.entry) {
+                pfn_metadata* pfn = get_pfn_from_PListEntry(standby_e);
+                PLIST_ENTRY next = standby_e->Flink;
+
+                EnterCriticalSection(&pfn->lock);
+                // Must be cleanly on standby and idle
+                if (pfn->state.list_type != LIST_STANDBY || pfn->state.being_written) {
+                    LeaveCriticalSection(&pfn->lock);
+                    standby_e = next;
+                    continue;
+                }
+                PPTE old_pte = pfn->pte;
+                if (old_pte == NULL) {
+                    // A standby frame with no PTE should never happen
+                    DebugBreak();
+                    LeaveCriticalSection(&pfn->lock);
+                    standby_e = next;
+                    continue;
+                }
+                // Region lock while holding list lock
+                CRITICAL_SECTION* region = get_pte_lock(old_pte);
+                if (!TryEnterCriticalSection(region)) {
+                    LeaveCriticalSection(&pfn->lock);
+                    standby_e = next;
+                    continue;
+                }
+                // PTE now points at the disc copy so repurpose frame
+                RemoveEntryList(&pfn->links);
+                InterlockedDecrement64(&standbyList_head.list_count);
+                set_pte_disc(old_pte, pfn->disc_index);
+                pfn->pte = NULL;
+                pfn->disc_index = INVALID_DISC_SLOT;
+                LeaveCriticalSection(region);
+
+                // Claim ownership over page so no other thread can grab it
+                pfn->state.list_type = LIST_NONE; // in-transit (off standby but not on zero)
+                ULONG64 tid = GetCurrentThreadId();
+                ULONG64 prev = InterlockedCompareExchange64(
+                    (LONG64 volatile*)&pfn->owner_thread_id, tid, 0);
+                if (prev != 0) {
+                    printf("BUG: zero_thread claimed pfn %p already owned by tid %llu\n", pfn, prev);
+                    DebugBreak();
+                }
+                LeaveCriticalSection(&pfn->lock);
+                pfns[count] = pfn;
+                frames[count] = pfn->frame_number;
+                count++;
+                standby_e = next;
+            }
+            LeaveCriticalSection(&standbyList_head.list_lock);
+            if (count == 0) break;
+
+            // Step 3: batch map, memset each, batch unmap
+            if (MapUserPhysicalPages(batch_base, count, frames) == FALSE) {
+                printf("zero_thread: batch map failed, count=%lu\n", count);
+                DebugBreak();
+            }
+            for (ULONG i = 0; i < count; i++) {
+                memset((char*)batch_base + (SIZE_T)i * PAGE_SIZE, 0, PAGE_SIZE);
+            }
+            if (MapUserPhysicalPages(batch_base, count, NULL) == FALSE) {
+                printf("zero_thread: batch unmap failed, count=%lu\n", count);
+                DebugBreak();
             }
 
-            // Move to zero list
-            EnterCriticalSection(&zeroList_head.list_lock);
-            InsertTailList(&zeroList_head.entry, &pfn->links);
-            InterlockedIncrement64(&zeroList_head.list_count);
-            LeaveCriticalSection(&zeroList_head.list_lock);
+            // Step 4: publish      
+            EnterCriticalSection(&freeList_head.list_lock);
+            for (ULONG i = 0; i < count; i++) {
+                pfns[i]->is_zero = 1;
+                pfns[i]->pte = NULL;
+                pfns[i]->disc_index = INVALID_DISC_SLOT;
+                pfns[i]->state.list_type = LIST_NONE;       // free
+                pfns[i]->owner_thread_id = 0;               // release so consumer re-claims
+                InsertTailList(&freeList_head.entry, &pfns[i]->links);
+                InterlockedIncrement64(&freeList_head.list_count);
+            }
+            LeaveCriticalSection(&freeList_head.list_lock);
+
+            SetEvent(redoFault_event);   // pages available 
         }
     }
 
@@ -1599,7 +2008,7 @@ full_virtual_memory_test(
     // Create two page fault threads
     HANDLE threads[NUM_THREADS] = { NULL };
     for (int i = 0; i < NUM_FAULT_THREADS; i++) {
-        threads[i] = CreateThread(NULL, 0, page_fault_thread, (PVOID)(ULONG_PTR)i, 0, NULL);
+        threads[i] = CreateThread(NULL, 0, page_fault_thread_nonrandom, (PVOID)(ULONG_PTR)i, 0, NULL);
     }
     threads[NUM_FAULT_THREADS] = CreateThread(NULL, 0, trim_thread, (PVOID)(ULONG_PTR)8, 0, NULL);
     threads[NUM_FAULT_THREADS+1] = CreateThread(NULL, 0, disc_thread, (PVOID)(ULONG_PTR)9, 0, NULL);
@@ -1613,14 +2022,14 @@ full_virtual_memory_test(
     }
     // Wait for fault threads to finish
     WaitForMultipleObjects(NUM_FAULT_THREADS, threads, TRUE, INFINITE);
+    
+    // Print statistics
     print_age_list_histogram();
     print_statistics();
     print_mm_stats();
 
     SetEvent(shutdown_event);
-
-    WaitForMultipleObjects(NUM_THREADS - NUM_FAULT_THREADS,
-                           &threads[NUM_FAULT_THREADS], TRUE, INFINITE);
+    WaitForMultipleObjects(NUM_THREADS - NUM_FAULT_THREADS, &threads[NUM_FAULT_THREADS], TRUE, INFINITE);
 
     // Close all handles
     for (int i = 0; i < NUM_THREADS; i++) {
@@ -1668,8 +2077,7 @@ full_virtual_memory_test(
     
 }
 
-
-VOID 
+VOID
 main(
     int argc,
     char** argv

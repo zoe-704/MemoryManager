@@ -44,6 +44,7 @@ PVOID disc;
 ULONG64 disc_page_count;
 
 // Counters
+volatile LONG64 loop_iterations;
 volatile LONG64 va_access_count;
 volatile LONG64 tick_call;
 volatile LONG64 disk_debug[32];
@@ -55,7 +56,8 @@ PULONG_PTR VA_SPACE;
 PVOID temp_va_base;
 ULONG_PTR virtual_address_size_in_unsigned_chunks;
 PULONG_PTR physical_page_numbers;
-
+SIZE_T scratch_bytes = (SIZE_T)NUM_THREADS * THREAD_SCRATCH_PAGES * PAGE_SIZE;
+volatile LONG64 g_trim_target = 0;
 __declspec(thread) int thread_index = -1;
 
 ULONG64 last_age_tick = 0;
