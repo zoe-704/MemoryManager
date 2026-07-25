@@ -733,7 +733,7 @@ return_disk_free_slots(
 // Age stuff
 BOOLEAN
 pte_was_accessed(PPTE pte)
-{
+{ 
     return (BOOLEAN)pte->hardware.accessed;
 }
 
@@ -1615,6 +1615,7 @@ trim_thread(
 ) {
     thread_index = (int)(ULONG_PTR)parameter;
     int count = 0;
+    static ULONG age_trim_counter = 0;
 
     // Create timer
     LARGE_INTEGER frequency;
@@ -1644,6 +1645,12 @@ trim_thread(
 
         count = 0;
         get_unmap_candidates_and_trim(&count, MAX_TRIM_PAGES);
+
+        ULONG64 now = GetTickCount64();
+        if (++age_trim_counter >= AGE_EVERY_N_TRIMS) {
+            SetEvent(startAge_event);
+            age_trim_counter = 0;
+        }
 
         if (count > 0 || modifiedList_head.list_count > 0) {    // ZS add threshold?
             SetEvent(modifiedReady_event);                      // wake up disk thread if there are trimmed pages
@@ -1821,8 +1828,9 @@ periodic_thread(PVOID parameter)
             zeroList_head.list_count, disc_stack_top,
             consume_rate, trim_rate, write_rate, soft_rate,
             runway_s);
-    }
 #endif
+    }
+
 
     // Stop timer and print result
     QueryPerformanceCounter(&end_time);

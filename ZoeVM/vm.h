@@ -96,6 +96,8 @@
 #define TARGET_RUNWAY_S        0.5
 #define MODIFIED_HIGH_WATER    (NUMBER_OF_PHYSICAL_PAGES / 8)
 
+#define AGE_EVERY_N_TRIMS       4
+
 #define DEBUG 1
 
 #if defined(DEBUG)
