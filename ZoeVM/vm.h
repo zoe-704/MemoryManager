@@ -37,41 +37,46 @@
 // virtual address space !
 //
 
-#define NUMBER_OF_PHYSICAL_PAGES   (GB(1) / PAGE_SIZE)
+#define NUMBER_OF_PHYSICAL_PAGES    (1 * GB(1) / PAGE_SIZE)
+#define NUM_DISC_PAGES              (3 * NUMBER_OF_PHYSICAL_PAGES)
+#define MAX_DISC_PTE_BITS           40
+#define MAX_DISC_SIZE               ((ULONG64) 1 << MAX_DISC_PTE_BITS)
+#define INVALID_DISC_SLOT           ((1ULL << MAX_DISC_PTE_BITS) - 1)
 
-#define NUM_DISC_PAGES  (NUMBER_OF_PHYSICAL_PAGES)
+#define NUM_FAULT_THREADS   8
+#define NUM_THREADS         13
 
-#define MAX_DISC_PTE_BITS 40
-
-#define MAX_DISC_SIZE ((ULONG64) 1 << MAX_DISC_PTE_BITS)
-
-#define INVALID_DISC_SLOT ((1ULL << MAX_DISC_PTE_BITS) - 1)
-
-#define PTES_PER_LOCK 512
-
-#define NUM_FAULT_THREADS 8
-#define NUM_THREADS       13
-
-#define MAX_TRIM_PAGES 512
-#define MIN_TRIM_BATCH 32
+#define MAX_TRIM_PAGES  512
+#define MIN_TRIM_BATCH  32
 #define LOW_ZERO_PAGE_THRESHOLD (NUMBER_OF_PHYSICAL_PAGES / 256)
 #define LOW_FREE_PAGE_THRESHOLD (NUMBER_OF_PHYSICAL_PAGES / 64)
 
-#define AGES 8
+#define WRITE_BATCH             64
+#define PTES_PER_LOCK           512
+#define DISC_REGIONS            64
+#define DISC_SLOTS_PER_REGION   (disc_page_count / DISC_REGIONS)
 
-#define PERIOD_MS 1000
-#define AGE_SLICE_DIVISOR 8
+#define LIST_NONE      0   // in transit, or on free/zero
+#define LIST_ACTIVE    1
+#define LIST_MODIFIED  2
+#define LIST_STANDBY   3
 
-#define MIN_AGE_INTERVAL_MS 10
-
-#define WRITE_BATCH 64
-
-#define STAGING_SLOTS        2                                      // [0] scrub and [1] stage
-#define THREAD_SCRATCH_PAGES (STAGING_SLOTS + WRITE_BATCH)
-
-#define SLOT_SCRUB           0
-#define SLOT_STAGE           1
-#define OFF_WRITE            STAGING_SLOTS
+#define MB_MUL          5
+#define MB_DIV          1
+#define AGE_EVERY_N_TRIMS       1
+#define MIN_AGE_INTERVAL_MS     10
+#define AGE_INTERVAL_MS         100   // age thread ticks on this fixed cadence, independent of trim pressure
+#define PERIODIC_INTERVAL_MS    500
+#define PERIOD_MS               1000
+#define AGES                    8
+#define AGE_SLICE_DIVISOR       4
+#define HOT_ZONE_BIAS           10   // 1-in-N cold jumps reach the wide slice; the rest stay in the hot zone
+#define HOT_ZONE_DIVISOR        16   // hot zone = slice / this
+#define AGE_TICK_MS             25      // fixed fast cadence of the age thread
+#define AGE_ALPHA               1.0     // T_sweep = V/(ALPHA*C); >1 ages faster
+#define AGE_TSWEEP_MIN_MS       100     // cap under heavy pressure
+#define AGE_TSWEEP_BASELINE_MS  300
+#define AGE_TSWEEP_MAX_MS       400      // even idle, sweep every ~0.4 s
 
 #define WORKING_SET_DIVISOR   1     // cold jumps confined to total_pages/this 
 #define HOT_SPOTS             16    // remembered spots per thread
@@ -80,11 +85,6 @@
 #define MIN_RUN_PAGES         4
 #define MAX_RUN_PAGES         32
 
-#define LIST_NONE      0   // in transit, or on free/zero
-#define LIST_ACTIVE    1
-#define LIST_MODIFIED  2
-#define LIST_STANDBY   3
-
 #define TEMP_VA_PER_THREAD   512
 #define STAGE_RING_PAGES     512
 #define SLOT_SCRUB           0
@@ -92,11 +92,8 @@
 #define OFF_WRITE            (OFF_STAGE + STAGE_RING_PAGES)
 #define THREAD_SCRATCH_PAGES (OFF_WRITE + WRITE_BATCH)
 
-#define PERIODIC_INTERVAL_MS   500
 #define TARGET_RUNWAY_S        0.5
 #define MODIFIED_HIGH_WATER    (NUMBER_OF_PHYSICAL_PAGES / 8)
-
-#define AGE_EVERY_N_TRIMS       4
 
 #define DEBUG 1
 
@@ -192,6 +189,15 @@ typedef struct _DISC_METADATA {
     BOOL isOccupied;
 } DISC_METADATA, * PDISC_METADATA;
 
+typedef struct _DISC_REGION {
+    CRITICAL_SECTION lock; // 1 bit?
+    ULONG64 base_slot;
+    ULONG64 slot_count;
+    ULONG64 free_count;
+    ULONG64 cursor;
+    BYTE* bytemap;
+} DISC_REGION, *PDISC_REGION;
+
 typedef struct _HOT_SPOT {
     ULONG64 base;
     ULONG64 len;
@@ -248,8 +254,9 @@ extern PDISC_METADATA disc_metadata;      // array of nodes, one per disc slot
 extern ULONG64* disc_free_stack;          // array of free slot indices
 extern volatile LONG64 disc_stack_top;    // index of next push slot == current count of free slots
 extern CRITICAL_SECTION disc_stack_lock;  // keep the lock for now (bitmap/lock-free is a later step)
-extern PVOID disc;
-extern ULONG64 disc_page_count;
+extern PVOID disc;                                                  
+extern ULONG64 disc_page_count;             
+extern PDISC_REGION disc_regions;         // array of DISC_REGIONS
 
 // Counters
 extern volatile LONG64 va_access_count;
@@ -275,7 +282,7 @@ extern __declspec(thread) int thread_index;
 extern ULONG64 last_age_tick;
 extern ULONG64 age_cursor;      // only age_thread touches it for now
 extern volatile LONG64 g_trim_target;
-
+extern volatile LONG64 g_age_regions_per_tick;
 
 // ---- Function prototypes ----
 

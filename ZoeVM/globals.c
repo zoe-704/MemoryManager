@@ -42,6 +42,7 @@ volatile LONG64 disc_stack_top;
 CRITICAL_SECTION disc_stack_lock;
 PVOID disc;
 ULONG64 disc_page_count;
+PDISC_REGION disc_regions;
 
 // Counters
 volatile LONG64 loop_iterations;
@@ -60,5 +61,8 @@ SIZE_T scratch_bytes = (SIZE_T)NUM_THREADS * THREAD_SCRATCH_PAGES * PAGE_SIZE;
 volatile LONG64 g_trim_target = 0;
 __declspec(thread) int thread_index = -1;
 
+// Aging
 ULONG64 last_age_tick = 0;
 ULONG64 age_cursor = 0;
+volatile LONG64 g_age_regions_per_tick = 1;   // clock-hand advance, tuned by periodic thread
+

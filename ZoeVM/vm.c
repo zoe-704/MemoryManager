@@ -579,7 +579,7 @@ set_pte_valid(PPTE pte, ULONG64 frame_number, ULONG64 age)
    
     snapshot.hardware.valid = 1;
     snapshot.hardware.accessed = 1; // freshly faulted-in page counts as accessed but set 0 to start as cold
-    snapshot.hardware.age = age;
+    snapshot.hardware.age = 0; // ZS only age?
     snapshot.hardware.frame_number = frame_number;
     snapshot.hardware.reserved = 0;
 
@@ -690,11 +690,66 @@ create_page_file(PULONG64 number_of_pages)
     return p;
 }
 
+// Returns a region with free space and returns it locked (or NULL if disc full)
+// Caller must LeaveCriticalSection(&reg->lock) when done
+static PDISC_REGION
+acquire_freest_disc_region(VOID)
+{
+    for (;;) {
+        // Step 1: find the region with the highest free_count (unlocked read)
+        PDISC_REGION best = NULL;
+        ULONG64 best_free = 0;
+        for (ULONG64 r = 0; r < DISC_REGIONS; r++) {
+            ULONG64 f = disc_regions[r].free_count;   // racy read
+            if (f > best_free) { best_free = f; best = &disc_regions[r]; }
+        }
+        if (best == NULL) return NULL;   // every region read as full
+
+        // Step 2: lock the candidate and confirm it still has room
+        EnterCriticalSection(&best->lock);
+        if (best->free_count > 0) return best;   // caller unlocks
+        LeaveCriticalSection(&best->lock);
+        // Lost the race and someone filled it so retry scan
+    }
+}
+
 // Return first free disc slot to fill
 ULONG64
 get_disk_free_slots(VOID)
 {
     InterlockedIncrement64(&disk_debug[0]);
+
+    PDISC_REGION disc_reg = acquire_freest_disc_region();
+    if (disc_reg == NULL) return(ULONG64) - 1;              // disc is full
+
+    // Find free byte starting at cursor and wrap once
+    ULONG64 n = disc_reg->slot_count;
+    ULONG64 c = disc_reg->cursor;
+    ULONG64 local = (ULONG64)-1;
+    for (LONG64 i = 0; i < n; i++) {
+        LONG64 idx = c + i;
+        if (idx >= n) idx -= n;
+        if (disc_reg->bytemap[idx] == 0) {
+            local = idx;
+            break;
+        }
+    }
+
+    // There were free pages so there must be a free slot
+    ASSERT(local != (ULONG64)-1);
+    disc_reg->bytemap[local] = 1;
+    disc_reg->free_count--;
+    disc_reg->cursor = (local + 1 < n) ? local + 1 : 0;
+
+    ULONG64 global_slot = disc_reg->base_slot + local;
+    LeaveCriticalSection(&disc_reg->lock);
+
+    InterlockedIncrement64(&disk_debug[1]);
+    ASSERT(global_slot < disc_page_count);
+    return global_slot;
+
+
+    /*
     EnterCriticalSection(&disc_stack_lock);
     if (disc_stack_top == 0) { // empty disc
         LeaveCriticalSection(&disc_stack_lock);
@@ -709,6 +764,7 @@ get_disk_free_slots(VOID)
     ASSERT(disc_metadata[slot].isOccupied == FALSE);
     disc_metadata[slot].isOccupied = TRUE;
     return slot;
+    */
 }
 
 // Push back to stack and mark metadata as free
@@ -717,8 +773,30 @@ return_disk_free_slots(
     ULONG64 slot
 ) {
     ASSERT(slot < disc_page_count);
-    PDISC_METADATA meta = &disc_metadata[slot];
 
+    // Map global slot->region and guard last possibly larger region
+    ULONG64 disc_idx = slot / DISC_SLOTS_PER_REGION;
+    if (disc_idx >= DISC_REGIONS) {
+        disc_idx = DISC_REGIONS - 1;
+    }
+    PDISC_REGION disc_reg = &disc_regions[disc_idx];
+    ULONG64 local = slot - disc_reg->base_slot;
+    ASSERT(local < disc_reg->slot_count);
+
+    EnterCriticalSection(&disc_reg->lock);
+    ASSERT(disc_reg->bytemap[local] == 1);  // must be occupied
+    //BOOL disc_was_full = (all_regions_full()); // ZS?
+    disc_reg->bytemap[local] = 0;
+    disc_reg->free_count++;
+    // Bias cursor back so just-freed slot fond quickly
+    disc_reg->cursor = local;
+    LeaveCriticalSection(&disc_reg->lock);
+    
+    //if (disc_was_full) SetEvent(diskReady_event);
+
+
+
+    /*PDISC_METADATA meta = &disc_metadata[slot];
     EnterCriticalSection(&disc_stack_lock);
     ASSERT(meta->isOccupied == TRUE);
     meta->isOccupied = FALSE;
@@ -727,7 +805,7 @@ return_disk_free_slots(
     disc_free_stack[disc_stack_top] = slot;
     disc_stack_top++;
     LeaveCriticalSection(&disc_stack_lock);
-    if (was_empty) SetEvent(diskReady_event); // ZS maybe a threshold?
+    if (was_empty) SetEvent(diskReady_event); // ZS maybe a threshold?*/
 }
 
 // Age stuff
@@ -761,6 +839,12 @@ pte_clear_accessed(PPTE pte)
 }
 
 // Age pages
+static __forceinline double 
+clampd(double v, double lo, double hi) 
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
 VOID
 AgeListTick(VOID)
 {
@@ -772,6 +856,67 @@ AgeListTick(VOID)
     for (ULONG64 n = 0; n < slice; n++) {
         ULONG64 i = age_cursor;
         age_cursor++;
+        if (age_cursor >= NUM_PTE_LOCKS) age_cursor = 0;
+
+        PPTE_REGION region = &pte_regions[i];
+        EnterCriticalSection(&region->lock);
+        if (region->active_page_count == 0) {
+            LeaveCriticalSection(&region->lock);
+            continue;
+        }
+
+        ULONG64 start = i * PTES_PER_LOCK;
+        ULONG64 end = min(start + PTES_PER_LOCK, num_ptes);
+        // Walk through each PTE in the region
+        for (ULONG64 j = start; j < end; j++) {
+            PPTE pte = page_table + j;
+
+            ULONG64 old = *(volatile ULONG64*)pte;
+            PTE snapshot;
+            *(ULONG64*)&snapshot = old;
+            if (snapshot.hardware.valid != 1) continue; // age only valid PTEs
+
+            PTE updated = snapshot;
+            ULONG64 from_age = snapshot.hardware.age;
+            ULONG64 to_age;
+
+            // Touched: decay one step toward hottest
+            if (snapshot.hardware.accessed) {
+                //to_age = (from_age > 0) ? from_age - 1 : 0;
+                to_age = 0;
+                updated.hardware.accessed = 0;
+            }
+            // Untouched: age up
+            else if (from_age < 7) {
+                to_age = from_age + 1;
+            }
+            else continue;   // cold and already maxed so nothing to do
+
+            updated.hardware.age = to_age;
+
+            // Publish first and buckets follow only if successful
+            if ((ULONG64)InterlockedCompareExchange64((LONG64*)pte,
+                *(LONG64*)&updated,
+                (LONG64)old) != old) {
+                continue;   // someone changed the PTE so buckets untouched, retry next tick
+            }
+
+            if (to_age != from_age) {
+                ASSERT(region->age_counts[from_age] > 0);
+                region->age_counts[from_age]--;
+                region->age_counts[to_age]++;
+            }
+        }
+        LeaveCriticalSection(&region->lock);
+    }
+}
+
+VOID AgeSweep(ULONG64 regions_to_sweep)      // was: slice computed from a #define
+{
+    InterlockedIncrement64(&tick_call);
+    for (ULONG64 n = 0; n < regions_to_sweep; n++) {
+        ULONG64 i = age_cursor;
+        age_cursor = (age_cursor + 1) % NUM_PTE_LOCKS;
         if (age_cursor >= NUM_PTE_LOCKS) age_cursor = 0;
 
         PPTE_REGION region = &pte_regions[i];
@@ -989,7 +1134,7 @@ handle_soft_fault(PVOID arbitrary_va)
     set_pte_valid(pte, frame, 1);
     InterlockedIncrement64(&activeList_head.list_count);
     region_struct->active_page_count++;
-    region_struct->age_counts[1]++;
+    region_struct->age_counts[0]++;
     LeaveCriticalSection(&activeList_head.list_lock);
 
     InterlockedIncrement64(&soft_fault_count);
@@ -1160,7 +1305,7 @@ handle_hard_fault(PVOID arbitrary_va)
         set_pte_valid(pte, new_pfn->frame_number, 1);
         InterlockedIncrement64(&activeList_head.list_count);
         region_struct->active_page_count++;
-        region_struct->age_counts[1]++;
+        region_struct->age_counts[0]++;
 
         InterlockedIncrement64(&hard_fault_count);
         LeaveCriticalSection(&activeList_head.list_lock);
@@ -1315,7 +1460,7 @@ page_fault_thread_random(
     BOOL page_faulted;
     BOOL fault_resolution = TRUE;
     PULONG_PTR arbitrary_va;
-    ULONG64 runtime = (1 * (MB(1) / 1));
+    ULONG64 runtime = (MB_MUL * (MB(1) / MB_DIV));
 
     // Now perform random accesses.
     while (i < runtime) {
@@ -1466,7 +1611,7 @@ page_fault_thread_nonrandom(
     BOOL page_faulted;
     BOOL fault_resolution = TRUE;
     PULONG_PTR arbitrary_va = NULL;
-    ULONG64 runtime = (1 * (MB(1) / 1));
+    ULONG64 runtime = (MB_MUL * (MB(1) / MB_DIV));
 
     while (i < runtime) {
         InterlockedIncrement64(&loop_iterations);
@@ -1498,10 +1643,14 @@ page_fault_thread_nonrandom(
                     run_left = hot[pick].len;
                 }
                 else {
-                    //
-                    // COLD JUMP: new location inside this thread's bounded slice.
-                    //
-                    base_page = slice_lo + (GetNextRandom(&thread_rng) % slice);
+                    // COLD JUMP with locality skew: ~90% of jumps land in a small hot zone
+                    // (stays young), ~10% reach the wider slice. Those wide pages are touched
+                    // rarely, sit idle, and age up -> a real 0..7 spread.
+                    ULONG64 span = ((GetNextRandom(&thread_rng) % HOT_ZONE_BIAS) != 0)
+                        ? (slice / HOT_ZONE_DIVISOR)   // common: small hot zone
+                        : slice;                        // rare: whole slice
+                    if (span == 0) span = 1;
+                    base_page = slice_lo + (GetNextRandom(&thread_rng) % span);
                     run_left = MIN_RUN_PAGES +
                         (GetNextRandom(&thread_rng) % (MAX_RUN_PAGES - MIN_RUN_PAGES));
                 }
@@ -1738,10 +1887,10 @@ age_thread(
 
     for (;;) {
         HANDLE waits[2] = { startAge_event, shutdown_event };
-        if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) break;
-        if (WaitForSingleObject(shutdown_event, 0) == WAIT_OBJECT_0) break;
-
-        AgeListTick();
+        //if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) break;
+        //if (WaitForSingleObject(shutdown_event, 0) == WAIT_OBJECT_0) break;
+        if (WaitForSingleObject(shutdown_event, AGE_TICK_MS) == WAIT_OBJECT_0) break;
+        AgeSweep((ULONG64)InterlockedOr64(&g_age_regions_per_tick, 0));
     }
 
     // Stop timer and print result
@@ -1808,6 +1957,25 @@ periodic_thread(PVOID parameter)
             + standbyList_head.list_count;
         double runway_s = (consume_rate > 0.0) ? (double)supply / consume_rate : 1e9;
 
+        // Dynamic aging
+        double C = consume_rate;                        // pages/s faulted in (Δhard_fault)
+        double V = (double)activeList_head.list_count;  // valid/resident pages
+        double S = supply;                              // supply — secondary pressure signal
+
+        double T_sweep_ms;
+        if (C < 1.0) {
+            T_sweep_ms = AGE_TSWEEP_BASELINE_MS;   // idle: keep ages fresh & differentiated (e.g. 300 ms)
+        }
+        else {
+            // V/C = time to churn the whole valid set at current pressure — the natural eviction timescale.
+            T_sweep_ms = (V / (AGE_ALPHA * C)) * 1000.0;
+            if (S < LOW_FREE_PAGE_THRESHOLD) T_sweep_ms *= 0.5;  // pool draining: sharpen ages faster
+            T_sweep_ms = clampd(T_sweep_ms, AGE_TSWEEP_MIN_MS, AGE_TSWEEP_BASELINE_MS);
+        }
+
+        LONG64 rpt = (LONG64)(NUM_PTE_LOCKS * (double)AGE_TICK_MS / T_sweep_ms);
+        InterlockedExchange64(&g_age_regions_per_tick, rpt < 1 ? 1 : rpt);
+
         // Dynamic trimming and writing signaling
         ULONG64 want = (ULONG64)(consume_rate * TARGET_RUNWAY_S);
         if (want < MIN_TRIM_BATCH) want = MIN_TRIM_BATCH;
@@ -1818,6 +1986,7 @@ periodic_thread(PVOID parameter)
         if (modifiedList_head.list_count > MODIFIED_HIGH_WATER) SetEvent(modifiedReady_event);
         if (zeroList_head.list_count < LOW_ZERO_PAGE_THRESHOLD) SetEvent(startZero_event);
         SetEvent(startAge_event);
+        ///
 
 #if DEBUG
         printf("\n[%6llums] act=%6lld mod=%6lld stby=%6lld free=%5lld zero=%5lld disc=%6lld "
@@ -2017,6 +2186,7 @@ full_virtual_memory_test(
     HANDLE threads[NUM_THREADS] = { NULL };
     for (int i = 0; i < NUM_FAULT_THREADS; i++) {
         threads[i] = CreateThread(NULL, 0, page_fault_thread_nonrandom, (PVOID)(ULONG_PTR)i, 0, NULL);
+        //threads[i] = CreateThread(NULL, 0, page_fault_thread_random, (PVOID)(ULONG_PTR)i, 0, NULL);
     }
     threads[NUM_FAULT_THREADS] = CreateThread(NULL, 0, trim_thread, (PVOID)(ULONG_PTR)8, 0, NULL);
     threads[NUM_FAULT_THREADS+1] = CreateThread(NULL, 0, disc_thread, (PVOID)(ULONG_PTR)9, 0, NULL);

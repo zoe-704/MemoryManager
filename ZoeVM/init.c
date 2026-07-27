@@ -128,6 +128,33 @@ init_disc(VOID)
     InitializeCriticalSectionAndSpinCount(&disc_stack_lock, 0x00FFFFFF);
 }
 
+VOID
+init_disc_allocator(VOID)
+{
+    disc_page_count = NUM_DISC_PAGES;
+    disc = create_page_file(&disc_page_count);
+
+    disc_regions = malloc(DISC_REGIONS * sizeof(DISC_REGION));
+    if (disc_regions == NULL) { DebugBreak(); return; }
+
+    ULONG64 assigned = 0;
+    for (ULONG64 r = 0; r < DISC_REGIONS; r++) {
+        PDISC_REGION reg = &disc_regions[r];
+        InitializeCriticalSectionAndSpinCount(&reg->lock, 0x00FFFFFF);
+        reg->base_slot = assigned;
+        // Last region absorbs the remainder so no slots are lost.
+        reg->slot_count = (r == DISC_REGIONS - 1)
+            ? (disc_page_count - assigned)
+            : DISC_SLOTS_PER_REGION;
+        reg->free_count = reg->slot_count;
+        reg->cursor = 0;
+        reg->bytemap = calloc(reg->slot_count, sizeof(BYTE)); // all free
+        if (reg->bytemap == NULL) { DebugBreak(); return; }
+        assigned += reg->slot_count;
+    }
+    ASSERT(assigned == disc_page_count);
+}
+
 // Initialize global locks
 VOID
 init_global_locks(
@@ -178,7 +205,8 @@ init(
 ) {
     init_lists();
     init_pfn_metadata(physical_page_count, physical_page_numbers);
-    init_disc();
+    //init_disc();
+    init_disc_allocator();
     init_events();
 }
 
@@ -377,7 +405,7 @@ setup_program(
     ULONG_PTR virtual_address_size = (physical_page_count + disc_page_count - 1) * PAGE_SIZE;
 
     // Round down to a PAGE_SIZE boundary
-    virtual_address_size &= ~PAGE_SIZE;
+    virtual_address_size &= ~((ULONG_PTR)PAGE_SIZE - 1);
 
     virtual_address_size_in_unsigned_chunks = virtual_address_size / sizeof(ULONG_PTR);
 
