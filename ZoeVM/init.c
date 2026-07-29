@@ -24,10 +24,11 @@ VOID
 init_lists(
     VOID
 ) {
-    InitializeList(&freeList_head);
-    InitializeList(&activeList_head);
-    InitializeList(&modifiedList_head);
-    InitializeList(&standbyList_head);
+    for (int i = 0; i < NUM_FAULT_THREADS; i++) {
+        InitializeList(&freeList_shards[i]);
+    }
+    InitializeConcurrentList(&modifiedList_head);
+    InitializeConcurrentList(&standbyList_head);
     InitializeList(&zeroList_head);
 }
 
@@ -94,8 +95,9 @@ init_pfn_metadata(
 
         InitializeListHead(&physical_slots[frame].links);
         InitializeCriticalSectionAndSpinCount(&physical_slots[frame].lock, 0x00FFFFFF);
-        InsertTailList(&freeList_head.entry, &physical_slots[frame].links);
-        freeList_head.list_count++;
+        int s = (int)(i % NUM_FREE_SHARDS);
+        InsertTailList(&freeList_shards[s].entry, &physical_slots[frame].links);
+        freeList_shards[s].list_count++;
     }
     // Commit only the used parts of pfn_metadata sparse array
     // Report actual commit footprint
@@ -111,21 +113,6 @@ init_pfn_metadata(
         (ULONG64)committed / MB(1),
         (ULONG64)table_reserve_size / MB(1),
         (ULONG64)physical_page_count);
-}
-
-// Initialize disc
-VOID
-init_disc(VOID)
-{
-    disc_page_count = NUM_DISC_PAGES;
-    disc = create_page_file(&disc_page_count);
-    disc_free_stack = malloc(disc_page_count * sizeof(ULONG64));
-    if (disc_free_stack == NULL) { DebugBreak(); }
-    for (ULONG64 i = 0; i < disc_page_count; i++) {
-        disc_free_stack[i] = i;          // every slot starts free
-    }
-    disc_stack_top = (LONG64)disc_page_count;   // all slots available and top == count
-    InitializeCriticalSectionAndSpinCount(&disc_stack_lock, 0x00FFFFFF);
 }
 
 VOID
@@ -198,6 +185,20 @@ init_events(
     shutdown_event = CreateEvent(NULL, TRUE, FALSE, NULL); // ZS implement event to shutdown all threads
 }
 
+// Initialize per-thread free-page caches
+VOID
+init_free_caches(
+    VOID
+) {
+    for (int i = 0; i < NUM_THREADS; i++) {
+        free_caches[i].count = 0;
+        for (int j = 0; j < FREE_CACHE_MAX; j++) {
+            free_caches[i].pages[j] = NULL;
+        }
+    }
+    cached_pages = 0;
+}
+
 VOID
 init(
     ULONG_PTR physical_page_count,
@@ -205,9 +206,9 @@ init(
 ) {
     init_lists();
     init_pfn_metadata(physical_page_count, physical_page_numbers);
-    //init_disc();
     init_disc_allocator();
     init_events();
+    init_free_caches();
 }
 
 BOOL

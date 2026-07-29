@@ -61,22 +61,19 @@
 #define LIST_MODIFIED  2
 #define LIST_STANDBY   3
 
-#define MB_MUL          5
-#define MB_DIV          1
+#define MB_MUL                  10
+#define MB_DIV                  1
 #define AGE_EVERY_N_TRIMS       1
-#define MIN_AGE_INTERVAL_MS     10
-#define AGE_INTERVAL_MS         100   // age thread ticks on this fixed cadence, independent of trim pressure
-#define PERIODIC_INTERVAL_MS    500
 #define PERIOD_MS               1000
+#define SOFT_FAULT_WRITE_WAIT_MS 2   // backoff when a soft fault hits a mid-write frame
 #define AGES                    8
 #define AGE_SLICE_DIVISOR       4
 #define HOT_ZONE_BIAS           10   // 1-in-N cold jumps reach the wide slice; the rest stay in the hot zone
 #define HOT_ZONE_DIVISOR        16   // hot zone = slice / this
 #define AGE_TICK_MS             25      // fixed fast cadence of the age thread
 #define AGE_ALPHA               1.0     // T_sweep = V/(ALPHA*C); >1 ages faster
-#define AGE_TSWEEP_MIN_MS       100     // cap under heavy pressure
-#define AGE_TSWEEP_BASELINE_MS  300
-#define AGE_TSWEEP_MAX_MS       400      // even idle, sweep every ~0.4 s
+#define AGE_TSWEEP_MIN_MS       25     // cap under heavy pressure
+#define AGE_TSWEEP_BASELINE_MS  50
 
 #define WORKING_SET_DIVISOR   1     // cold jumps confined to total_pages/this 
 #define HOT_SPOTS             16    // remembered spots per thread
@@ -85,15 +82,20 @@
 #define MIN_RUN_PAGES         4
 #define MAX_RUN_PAGES         32
 
-#define TEMP_VA_PER_THREAD   512
 #define STAGE_RING_PAGES     512
 #define SLOT_SCRUB           0
 #define OFF_STAGE            1
 #define OFF_WRITE            (OFF_STAGE + STAGE_RING_PAGES)
 #define THREAD_SCRATCH_PAGES (OFF_WRITE + WRITE_BATCH)
 
-#define TARGET_RUNWAY_S        0.5
+#define TARGET_REMAINING_S     0.5
 #define MODIFIED_HIGH_WATER    (NUMBER_OF_PHYSICAL_PAGES / 8)
+
+#define FREE_CACHE_MAX      64                  // per-thread free-page magazine capacity
+#define NUM_FREE_SHARDS     NUM_FAULT_THREADS   // one free-list shard per fault thread (8)
+#define FREE_REFILL_BATCH   32                  // pages pulled from a shard into the cache per refill
+
+#define WINDOW_RETRY_LIMIT  5
 
 #define DEBUG 1
 
@@ -108,12 +110,20 @@
 
 // ---- Types ----
 
-// Struct for lists
+// Struct for coarse-locked lists (free shards + zero)
 typedef struct _LIST_HEAD_ENTRY {
     LIST_ENTRY entry;
     CRITICAL_SECTION list_lock;
     ULONG64 list_count;
 } LIST_HEAD, * PLIST_HEAD;
+
+// Struct for fine-grained concurrent lists (standby + modified)
+typedef struct _CONCURRENT_LIST_HEAD {
+    LIST_ENTRY entry;
+    SRWLOCK srw;                  // shared = parallel removers, exclusive = inserter
+    CRITICAL_SECTION head_lock;   // stands in as the anchor entry's per-node lock
+    ULONG64 list_count;           // updated with Interlocked under shared srw
+} CONCURRENT_LIST_HEAD, * PCONCURRENT_LIST_HEAD;
 
 // Struct for our PTEs
 typedef struct _VALID_PTE {
@@ -203,6 +213,14 @@ typedef struct _HOT_SPOT {
     ULONG64 len;
 } HOT_SPOT;
 
+typedef struct _FREE_PAGE_CACHE {
+    ULONG64 count;
+    pfn_metadata* pages[FREE_CACHE_MAX];
+} FREE_PAGE_CACHE;
+
+extern FREE_PAGE_CACHE free_caches[NUM_THREADS];     // one per thread, reachable by the trimmer
+extern volatile LONG64 cached_pages;                 // pages currently parked in caches
+
 // Per-category counter block
 typedef struct _MM_STAT {
     volatile LONG64 calls;
@@ -223,10 +241,9 @@ typedef struct _THREAD_RNG_STATE {
 extern ULONG64 NUM_PTE_LOCKS;
 
 // PTE list heads
-extern LIST_HEAD freeList_head;
-extern LIST_HEAD activeList_head;
-extern LIST_HEAD modifiedList_head;
-extern LIST_HEAD standbyList_head;
+extern LIST_HEAD freeList_shards[NUM_FAULT_THREADS];
+extern CONCURRENT_LIST_HEAD modifiedList_head;
+extern CONCURRENT_LIST_HEAD standbyList_head;
 extern LIST_HEAD zeroList_head;
 
 // Events
@@ -267,9 +284,9 @@ extern volatile LONG64 hard_fault_count;
 extern volatile LONG64 soft_fault_count;
 
 // Per-category counter block
-static MM_STAT g_trim_stat;
-static MM_STAT g_write_stat;
-static LARGE_INTEGER g_qpc_freq;   // set once via QueryPerformanceFrequency
+extern MM_STAT g_trim_stat;
+extern MM_STAT g_write_stat;
+extern LARGE_INTEGER g_qpc_freq;   // set once via QueryPerformanceFrequency
 
 // Other globals
 extern PULONG_PTR VA_SPACE;
@@ -282,6 +299,7 @@ extern __declspec(thread) int thread_index;
 extern ULONG64 last_age_tick;
 extern ULONG64 age_cursor;      // only age_thread touches it for now
 extern volatile LONG64 g_trim_target;
+extern volatile LONG64 g_trim_full_throttle;
 extern volatile LONG64 g_age_regions_per_tick;
 
 // ---- Function prototypes ----
@@ -293,6 +311,7 @@ ULONG64 GetNextRandom(THREAD_RNG_STATE* rng);
 // Linked list primitives
 VOID InitializeListHead(PLIST_ENTRY ListHead);
 VOID InitializeList(PLIST_HEAD Head);
+VOID InitializeConcurrentList(PCONCURRENT_LIST_HEAD Head);
 BOOLEAN IsListEmpty(PLIST_ENTRY ListHead);
 VOID InsertHeadList(PLIST_ENTRY ListHead, PLIST_ENTRY Entry);
 VOID InsertTailList(PLIST_ENTRY ListHead, PLIST_ENTRY Entry);
@@ -301,6 +320,10 @@ BOOLEAN RemoveEntryList(PLIST_ENTRY Entry);
 
 // Allocation helpers
 PVOID zero_malloc(size_t num_bytes);
+
+static BOOL try_lock_window(PLIST_HEAD L, PLIST_ENTRY a, PLIST_ENTRY b, PLIST_ENTRY c);
+static BOOL list_remove_locked(PLIST_HEAD L, pfn_metadata* pfn);
+static BOOL list_insert_tail_locked(PLIST_HEAD L, pfn_metadata* pfn);
 
 // Getters
 PPTE_REGION get_pte_region(PPTE pte);
@@ -315,6 +338,8 @@ VOID get_unmap_candidates_and_trim(int* batch_count, INT batch_size);
 pfn_metadata* get_pfn_from_free(VOID);
 pfn_metadata* get_pfn_from_standby(VOID);
 pfn_metadata* get_free_pfn(VOID);
+
+static ULONG refill_free_cache(FREE_PAGE_CACHE* cache, int shard);
 
 // PTE setters
 VOID set_pte_valid(PPTE pte, ULONG64 frame_number, ULONG64 age);
@@ -345,6 +370,7 @@ VOID init_disc(VOID);
 VOID init_global_locks(VOID);
 VOID init_pte_regions(VOID);
 VOID init_events(VOID);
+VOID init_free_caches(VOID);
 VOID init(ULONG_PTR physical_page_count, PULONG_PTR physical_page_numbers);
 
 // Diagnostics
@@ -374,3 +400,4 @@ DWORD WINAPI periodic_thread(PVOID parameter);
 
 // Test driver
 VOID full_virtual_memory_test(VOID);
+

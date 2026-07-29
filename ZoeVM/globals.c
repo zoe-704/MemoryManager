@@ -10,10 +10,9 @@
 ULONG64 NUM_PTE_LOCKS = 0;
 
 // PTE list heads
-LIST_HEAD freeList_head;
-LIST_HEAD activeList_head;
-LIST_HEAD modifiedList_head;
-LIST_HEAD standbyList_head;
+LIST_HEAD freeList_shards[NUM_FAULT_THREADS];
+CONCURRENT_LIST_HEAD modifiedList_head;
+CONCURRENT_LIST_HEAD standbyList_head;
 LIST_HEAD zeroList_head;
 
 // Events
@@ -59,6 +58,7 @@ ULONG_PTR virtual_address_size_in_unsigned_chunks;
 PULONG_PTR physical_page_numbers;
 SIZE_T scratch_bytes = (SIZE_T)NUM_THREADS * THREAD_SCRATCH_PAGES * PAGE_SIZE;
 volatile LONG64 g_trim_target = 0;
+volatile LONG64 g_trim_full_throttle = 0;   // 1 when consume_rate > trim_rate: trimmer runs flat-out
 __declspec(thread) int thread_index = -1;
 
 // Aging
@@ -66,3 +66,6 @@ ULONG64 last_age_tick = 0;
 ULONG64 age_cursor = 0;
 volatile LONG64 g_age_regions_per_tick = 1;   // clock-hand advance, tuned by periodic thread
 
+// Per-thread free-page caches
+FREE_PAGE_CACHE free_caches[NUM_THREADS];
+volatile LONG64 cached_pages = 0;
