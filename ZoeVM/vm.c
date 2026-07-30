@@ -431,19 +431,34 @@ claim_rescued_pfn(pfn_metadata * pfn)
     }
 }
 
-// Lock current pfn
-// Not shared/exclusive srw --> frame locked and srw held
-VOID
+// Lock a specific pfn for removal, escalating under contention. Returns TRUE with the frame
+// locked and the srw held (mode in *exclusive); FALSE if the frame is contended (an inserter
+// holds it), in which case nothing is held and the caller should retry.
+// NOTE: the escalated path TryEnters the frame lock -- never blocks on it while holding the srw
+// exclusive -- otherwise it would deadlock with inserters that hold pfn->lock then take srw.
+BOOLEAN
 lock_pfn_for_remove(PCONCURRENT_LIST_HEAD list, pfn_metadata* pfn, BOOLEAN* exclusive)
 {
     AcquireSRWLockShared(&list->srw);
     for (int attempts = 0; attempts < WINDOW_RETRY_LIMIT; attempts++) {
-        if (try_lock_pfn_window(list, pfn)) { *exclusive = FALSE; return; }
+        if (try_lock_pfn_window(list, pfn)) { *exclusive = FALSE; return TRUE; }
     }
     ReleaseSRWLockShared(&list->srw);          // fall in line behind the exclusive lock
     AcquireSRWLockExclusive(&list->srw);
-    EnterCriticalSection(&pfn->lock);
+    if (!TryEnterCriticalSection(&pfn->lock)) {
+        ReleaseSRWLockExclusive(&list->srw);
+        return FALSE;                          // contended by an inserter; caller retries
+    }
+    // Under exclusive we're the sole mutator, so the links are stable: verify the frame is still
+    // stitched into a list before the caller unlinks it (matches the shared path's revalidation,
+    // and guards against a frame that was removed but still carries a stale list_type).
+    if (pfn->links.Blink->Flink != &pfn->links || pfn->links.Flink->Blink != &pfn->links) {
+        LeaveCriticalSection(&pfn->lock);
+        ReleaseSRWLockExclusive(&list->srw);
+        return FALSE;
+    }
     *exclusive = TRUE;
+    return TRUE;
 }
 
 // Unlock current pfn
@@ -486,7 +501,9 @@ get_pfn_from_fn(ULONG64 fn)
 VOID
 get_unmap_candidates_and_trim(int* batch_count, INT batch_size) 
 {
+#if STATISTICS
     LONG64 t0 = QPC();
+#endif
     ULONG trimmed = 0;
 
     PULONG_PTR unmap_vas[MAX_TRIM_PAGES] = { NULL };
@@ -578,7 +595,11 @@ get_unmap_candidates_and_trim(int* batch_count, INT batch_size)
             DebugBreak();
         }
     }
+#if STATISTICS
     stat_add(&g_trim_stat, QPC() - t0, 0, trimmed);
+#else
+    InterlockedAdd64(&g_trim_stat.pages, trimmed);   // pages feed the rate control, keep them live
+#endif
     return;
 }
 
@@ -1211,7 +1232,11 @@ handle_soft_fault(PVOID arbitrary_va)
     PCONCURRENT_LIST_HEAD list_head = (lt == LIST_STANDBY) ? &standbyList_head : &modifiedList_head;
 
     BOOLEAN exclusive;
-    lock_pfn_for_remove(list_head, pfn, &exclusive);
+    if (!lock_pfn_for_remove(list_head, pfn, &exclusive)) {
+        // Frame is held by an inserter mid-transition; retry the fault from the top
+        LeaveCriticalSection(region);
+        return FALSE;
+    }
 
     // Reread under frame lock
     if (pfn->state.list_type != lt || pfn->state.being_written) {
@@ -1229,6 +1254,10 @@ handle_soft_fault(PVOID arbitrary_va)
     RemoveEntryList(&pfn->links);
     ASSERT(list_head->list_count != 0);
     InterlockedDecrement64(&list_head->list_count);
+    // Mark it off any list BEFORE dropping the lock. Otherwise a concurrent fault on the same
+    // frame (PTE still in transition) sees the stale list_type, escalates, and tries to unlink
+    // an already-removed page -> corrupts the list.
+    pfn->state.list_type = LIST_NONE;
     unlock_pfn_for_remove(list_head, pfn, exclusive);
 
     // Align VA and map to frame
@@ -1338,7 +1367,8 @@ handle_hard_fault(PVOID arbitrary_va)
             // ZS batch write this
             new_pfn->state.list_type = LIST_NONE;
             new_pfn->disc_index = INVALID_DISC_SLOT;
-            new_pfn->owner_thread_id = 0; 
+            new_pfn->owner_thread_id = 0;
+            new_pfn->is_zero = 0;                       // free list holds garbage
             InsertHeadList(&sh->entry, &new_pfn->links);
             InterlockedIncrement64(&sh->list_count);
             LeaveCriticalSection(&sh->list_lock);
@@ -1347,12 +1377,13 @@ handle_hard_fault(PVOID arbitrary_va)
         }
         if (pte->transition.transition == 1) {
             LeaveCriticalSection(region);
-            // Return frame like above 
+            // Return frame like above
             EnterCriticalSection(&sh->list_lock);
             // ZS batch write this
             new_pfn->state.list_type = LIST_NONE;
             new_pfn->disc_index = INVALID_DISC_SLOT;
             new_pfn->owner_thread_id = 0;
+            new_pfn->is_zero = 0;                       // free list holds garbage
             InsertHeadList(&sh->entry, &new_pfn->links);
             InterlockedIncrement64(&sh->list_count);   
             LeaveCriticalSection(&sh->list_lock);
@@ -1492,14 +1523,18 @@ write_modified_list(VOID)
 
     // Step 2: batch map, c amount of copies, batch unmap
     if (count > 0) {
+#if STATISTICS
         LONG64 t0 = QPC();
+#endif
         // Batch map
         if (MapUserPhysicalPages(batch_base, count, frames) == FALSE) {
             printf("batch map failed, count=%lu\n", count);
             DebugBreak();
         }
+#if STATISTICS
         LONG64 t_map = QPC() - t0;
         LONG64 t_copy_total = 0;
+#endif
 
         // Create c amount of copies
         for (ULONG i = 0; i < count; i++) {
@@ -1513,16 +1548,24 @@ write_modified_list(VOID)
 
             // Memcpy data to disk
             PULONG_PTR src = (PULONG_PTR)((char*)batch_base + (i * PAGE_SIZE));
+#if STATISTICS
             LONG64 t1 = QPC();
+#endif
             memcpy((BYTE*)disc + slots[i] * PAGE_SIZE, src, PAGE_SIZE);
+#if STATISTICS
             t_copy_total += QPC() - t1;
+#endif
         }
         // Batch unmap
         if (MapUserPhysicalPages(batch_base, count, NULL) == FALSE) {
             printf("batch map failed, count=%lu\n", count);
             DebugBreak();
         }
+#if STATISTICS
         stat_add(&g_write_stat, t_map, t_copy_total, count);
+#else
+        InterlockedAdd64(&g_write_stat.pages, count);   // pages feed the rate control, keep them live
+#endif
         
         // Step 3: commit to standby and clean up rescued
         for (ULONG i = 0; i < count; i++) {
@@ -1573,6 +1616,11 @@ zero_pfns(PULONG_PTR batch_base)
         LeaveCriticalSection(&sh->list_lock);
     }
 
+    // Pages [0, from_free) came off the free shards as garbage -> they get zeroed onto the zero
+    // list. Pages [from_free, count) are rescued off standby -> they go back onto the free shards
+    // as garbage (and get zeroed onto the zero list on a later pass).
+    ULONG from_free = count;
+
     // Step 2: claim frames off of standby list via rescue-to-disc steps
     BOOLEAN exclusive = FALSE;
     AcquireSRWLockShared(&standbyList_head.srw);
@@ -1617,35 +1665,52 @@ zero_pfns(PULONG_PTR batch_base)
     else ReleaseSRWLockShared(&standbyList_head.srw);
     if (count == 0) return 0;
 
-    // Step 3: batch map, memset each, batch unmap
-    if (MapUserPhysicalPages(batch_base, count, frames) == FALSE) {
-        printf("zero_thread: batch map failed, count=%lu\n", count);
-        DebugBreak();
-    }
-    for (ULONG i = 0; i < count; i++) {
-        memset((char*)batch_base + (SIZE_T)i * PAGE_SIZE, 0, PAGE_SIZE);
-    }
-    if (MapUserPhysicalPages(batch_base, count, NULL) == FALSE) {
-        printf("zero_thread: batch unmap failed, count=%lu\n", count);
-        DebugBreak();
+    // Step 3: zero only the free-shard pages (map, memset, unmap); standby-rescued pages stay garbage
+    if (from_free > 0) {
+        if (MapUserPhysicalPages(batch_base, from_free, frames) == FALSE) {
+            printf("zero_thread: batch map failed, count=%lu\n", from_free);
+            DebugBreak();
+        }
+        for (ULONG i = 0; i < from_free; i++) {
+            memset((char*)batch_base + (SIZE_T)i * PAGE_SIZE, 0, PAGE_SIZE);
+        }
+        if (MapUserPhysicalPages(batch_base, from_free, NULL) == FALSE) {
+            printf("zero_thread: batch unmap failed, count=%lu\n", from_free);
+            DebugBreak();
+        }
     }
 
-    // Step 4: publish    
-    for (int s = 0; s < NUM_FREE_SHARDS; s++) {
-        PLIST_HEAD sh = &freeList_shards[s];
-        EnterCriticalSection(&sh->list_lock);
-        for (ULONG i = s; i < count; i += NUM_FREE_SHARDS) {
+    // Step 4a: publish zeroed pages -> zero list (clean)
+    if (from_free > 0) {
+        EnterCriticalSection(&zeroList_head.list_lock);
+        for (ULONG i = 0; i < from_free; i++) {
             pfns[i]->is_zero = 1;
             pfns[i]->pte = NULL;
             pfns[i]->disc_index = INVALID_DISC_SLOT;
-            pfns[i]->state.list_type = LIST_NONE;       // free
+            pfns[i]->state.list_type = LIST_NONE;
+            pfns[i]->owner_thread_id = 0;               // release so consumer re-claims
+            InsertTailList(&zeroList_head.entry, &pfns[i]->links);
+            InterlockedIncrement64(&zeroList_head.list_count);
+        }
+        LeaveCriticalSection(&zeroList_head.list_lock);
+    }
+
+    // Step 4b: publish standby-rescued pages -> free shards (garbage)
+    for (int s = 0; s < NUM_FREE_SHARDS; s++) {
+        PLIST_HEAD sh = &freeList_shards[s];
+        EnterCriticalSection(&sh->list_lock);
+        for (ULONG i = from_free + s; i < count; i += NUM_FREE_SHARDS) {
+            pfns[i]->is_zero = 0;                       // free list holds garbage
+            pfns[i]->pte = NULL;
+            pfns[i]->disc_index = INVALID_DISC_SLOT;
+            pfns[i]->state.list_type = LIST_NONE;
             pfns[i]->owner_thread_id = 0;               // release so consumer re-claims
             InsertTailList(&sh->entry, &pfns[i]->links);
             InterlockedIncrement64(&sh->list_count);
         }
         LeaveCriticalSection(&sh->list_lock);
     }
-    SetEvent(redoFault_event);   // pages available 
+    SetEvent(redoFault_event);   // pages available
     return count;
 }
 
@@ -2000,6 +2065,14 @@ trim_thread(PVOID parameter)
             if (WaitForSingleObject(shutdown_event, 0) == WAIT_OBJECT_0) break;
         }
 
+        // Backpressure: if the write pipeline is backed up, yield and let the writer drain
+        // instead of dumping more pages onto the modified list.
+        if (modifiedList_head.list_count > MODIFIED_HIGH_WATER) {
+            SetEvent(modifiedReady_event);
+            if (WaitForSingleObject(shutdown_event, 1) == WAIT_OBJECT_0) break;
+            continue;
+        }
+
         LONG64 batch = InterlockedOr64(&g_trim_target, 0);
         if (batch <= 0) batch = MIN_TRIM_BATCH;
         if (batch > MAX_TRIM_PAGES) batch = MAX_TRIM_PAGES;
@@ -2152,10 +2225,18 @@ periodic_thread(PVOID parameter)
         prev_trimmed = trimmed; 
         prev_written = written;
 
-        ULONG64 supply = free_pages_total()
+        // Ready pages are immediately usable; in-flight (modified) pages are already trimmed
+        // and just awaiting write-back, so they count toward the trim runway but not toward aging.
+        ULONG64 ready = free_pages_total()
             + zeroList_head.list_count
             + standbyList_head.list_count;
+        ULONG64 in_flight = modifiedList_head.list_count;
+        ULONG64 supply = ready + in_flight;
         double remaining_s = (consume_rate > 0.0) ? (double)supply / consume_rate : 1e9;
+
+        // Writer is behind while the modified backlog is over the high-water mark; trimming
+        // pauses until it drains so we don't pile more onto an already-full modified list.
+        LONG64 writer_behind = (in_flight > MODIFIED_HIGH_WATER);
 
         // Dynamic aging
         // steady-state/idle: set baseline target sweep time 
@@ -2169,7 +2250,7 @@ periodic_thread(PVOID parameter)
         else {
             // V/C = time to churn the whole valid set at current pressure (natural eviction timescale)
             T_sweep_ms = (valid_count / (AGE_ALPHA * consume_rate)) * 1000.0;
-            if (supply < LOW_FREE_PAGE_THRESHOLD) T_sweep_ms *= 0.5;  // pool draining: sharpen ages faster
+            if (ready < LOW_FREE_PAGE_THRESHOLD) T_sweep_ms *= 0.5;  // pool draining: sharpen ages faster
             T_sweep_ms = clampd(T_sweep_ms, AGE_TSWEEP_MIN_MS, AGE_TSWEEP_BASELINE_MS);
         }
 
@@ -2179,7 +2260,7 @@ periodic_thread(PVOID parameter)
         // Dynamic trimming
         // consume_rate > trim_rate falling behind so max trimming
         // otherwise: balance with consumption rate
-        LONG64 behind = (consume_rate > trim_rate);
+        LONG64 behind = (consume_rate > trim_rate) && !writer_behind;
         InterlockedExchange64(&g_trim_full_throttle, behind);
 
         ULONG64 want;
@@ -2194,7 +2275,7 @@ periodic_thread(PVOID parameter)
         InterlockedExchange64(&g_trim_target, (LONG64)want);
 
         SetEvent(startAge_event);
-        if (behind || remaining_s < TARGET_REMAINING_S) SetEvent(startTrim_event);
+        if (!writer_behind && (behind || remaining_s < TARGET_REMAINING_S)) SetEvent(startTrim_event);
         if (modifiedList_head.list_count > MODIFIED_HIGH_WATER) SetEvent(modifiedReady_event);
         if (zeroList_head.list_count < LOW_ZERO_PAGE_THRESHOLD) SetEvent(startZero_event);
 

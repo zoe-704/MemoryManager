@@ -98,6 +98,7 @@
 #define WINDOW_RETRY_LIMIT  5
 
 #define DEBUG 1
+#define STATISTICS 1   // 0 = compile out QPC timing in the trim/write hot paths for max speed
 
 #if defined(DEBUG)
 #define ASSERT(condition) \
