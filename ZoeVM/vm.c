@@ -133,7 +133,7 @@ stat_add(MM_STAT* s, LONG64 t, LONG64 tsub, LONG64 pages) {
     InterlockedAdd64(&s->pages, pages);
 }
 
-// Convert raw QPC ticks to milliseconds using the process-wide frequency.
+// Convert raw QPC ticks to milliseconds using the process-wide frequency
 // g_qpc_freq must be set once (QueryPerformanceFrequency) before any stats priint since guard returns 0.0
 static DOUBLE
 ms(LONG64 ticks) {
@@ -142,7 +142,6 @@ ms(LONG64 ticks) {
 }
 
 // Allocate and manage each thread's allocated scratch pages in temp_va_base
-
 __declspec(thread) ULONG stage_cursor = 0;
 
 // Each thread owns a non-overlapping THREAD_SCRATCH_PAGES pages chunk of shared temp_va_base to avoid collisions
@@ -163,7 +162,7 @@ thread_scrub_slot(VOID)
 }
 
 // Base of this thread's WRITE_BATCH-page window, used by write_modified_list
-// (and zero_thread) to batch-map a run of frames for a single map/copy/unmap.
+// (and zero_thread) to batch-map a run of frames for a single map/copy/unmap
 static __forceinline PULONG_PTR
 thread_write_base(VOID) 
 { 
@@ -171,7 +170,7 @@ thread_write_base(VOID)
 }
 
 // Base of this thread's staging ring, used on the hard-fault disc-restore path
-// to map frames one slot at a time and amortize the unmap over many faults.
+// to map frames one slot at a time and amortize the unmap over many faults
 static __forceinline PULONG_PTR
 thread_stage_base(VOID)
 {
@@ -312,6 +311,39 @@ RemoveEntryList(PLIST_ENTRY Entry)
     return (BOOLEAN)(Flink == Blink);
 }
 
+// Atomic single-field updates to the shared pfn->state.whole word
+// list_type is written on list paths
+// being_written is written on writer/commit path 
+// CAS-loop: read the whole word, set field, InterlockedCompareExchange64, and retry on miss
+static __forceinline VOID
+pfn_state_set_list_type(pfn_metadata* p, ULONG64 lt)
+{
+    volatile LONG64* target = (volatile LONG64*)&p->state.whole;
+    for (;;) {
+        PFN_STATE cur, nxt;
+        cur.whole = (ULONG64)*target;
+        nxt = cur;
+        nxt.list_type = lt;
+        if (InterlockedCompareExchange64(target, (LONG64)nxt.whole, (LONG64)cur.whole) == (LONG64)cur.whole) {
+            return;
+        }
+    }
+}
+static __forceinline VOID
+pfn_state_set_being_written(pfn_metadata* p, ULONG64 bw)
+{
+    volatile LONG64* target = (volatile LONG64*)&p->state.whole;
+    for (;;) {
+        PFN_STATE cur, nxt;
+        cur.whole = (ULONG64)*target;
+        nxt = cur;
+        nxt.being_written = bw;
+        if (InterlockedCompareExchange64(target, (LONG64)nxt.whole, (LONG64)cur.whole) == (LONG64)cur.whole) {
+            return;
+        }
+    }
+}
+
 // Getters
 // Getting pte regions
 PPTE_REGION
@@ -347,69 +379,20 @@ get_va_from_pte(PPTE pte)
     return (PULONG_PTR)((ULONG_PTR)page_va & ~(PAGE_SIZE - 1)); 
 }
 
-// Getting lock guarding list entry's links
-CRITICAL_SECTION*
-get_entry_lock(PCONCURRENT_LIST_HEAD list, PLIST_ENTRY entry)
-{
-    if (entry == &list->entry) {
-        return &list->head_lock;
-    }
-    return &get_pfn_from_PListEntry(entry)->lock;
-}
-
-// Try to lock pfn together with flink and blink using TryEnter
-// Check that pfn is still between flink and blink
-BOOLEAN
-try_lock_pfn_window(PCONCURRENT_LIST_HEAD list, pfn_metadata* pfn)
-{
-    PLIST_ENTRY flink = pfn->links.Flink;
-    PLIST_ENTRY blink = pfn->links.Blink;
-
-    CRITICAL_SECTION* flink_lock = get_entry_lock(list, flink);
-    CRITICAL_SECTION* blink_lock = get_entry_lock(list, blink);
-
-    if (!TryEnterCriticalSection(flink_lock)) {
-        return FALSE;
-    }
-    if (!TryEnterCriticalSection(&pfn->lock)) {
-        LeaveCriticalSection(flink_lock);
-        return FALSE;
-    }
-    if (!TryEnterCriticalSection(blink_lock)) {
-        LeaveCriticalSection(&pfn->lock);
-        LeaveCriticalSection(flink_lock);
-        return FALSE;
-    }
-
-    // Re-check under the locks: the pfn may have been unlinked or moved before we got its lock
-    if (pfn->links.Flink != flink || pfn->links.Blink != blink ||
-        blink->Flink != &pfn->links || flink->Blink != &pfn->links) {
-        LeaveCriticalSection(blink_lock);
-        LeaveCriticalSection(&pfn->lock);
-        LeaveCriticalSection(flink_lock);
-        return FALSE;
-    }
-    return TRUE;
-}
-
-// Release a window taken by try_lock_pfn_window
-VOID
-unlock_pfn_window(PCONCURRENT_LIST_HEAD list, pfn_metadata* pfn)
-{
-    LeaveCriticalSection(get_entry_lock(list, pfn->links.Flink));
-    LeaveCriticalSection(&pfn->lock);
-    LeaveCriticalSection(get_entry_lock(list, pfn->links.Blink));
-}
-
-// Repurpose a standby frame in place: point its PTE at the disc copy and clear the frame's pte/disc
-// Caller holds the frame's lock (window or exclusive)
+// Repurpose a standby frame by pointing its PTE at the disc copy and clearing the frame's pte/disc
+// Caller holds the frame's lock
 BOOLEAN
 rescue_standby_to_disc(pfn_metadata* pfn)
 {
     PPTE old_pte = pfn->pte;
-    if (old_pte == NULL) { DebugBreak(); return FALSE; }   // standby frame with no PTE: impossible
+    if (old_pte == NULL) {  // standby frame must have a pte
+        DebugBreak();
+        return FALSE;
+    }
     CRITICAL_SECTION* region = get_pte_lock(old_pte);
-    if (!TryEnterCriticalSection(region)) { return FALSE; }
+    if (!TryEnterCriticalSection(region)) { 
+        return FALSE; 
+    }
     set_pte_disc(old_pte, pfn->disc_index);
     pfn->pte = NULL;
     pfn->disc_index = INVALID_DISC_SLOT;
@@ -421,57 +404,13 @@ rescue_standby_to_disc(pfn_metadata* pfn)
 VOID
 claim_rescued_pfn(pfn_metadata * pfn)
 {
-    pfn->state.list_type = LIST_NONE;   // off standby, in-transit
+    pfn_state_set_list_type(pfn, LIST_NONE);   // off standby, in-transit
     ULONG64 tid = GetCurrentThreadId();
     ULONG64 prev = InterlockedCompareExchange64((LONG64 volatile*)&pfn->owner_thread_id, tid, 0);
     if (prev != 0) {
         printf("BUG: standby rescue handed out pfn %p already owned by tid %llu (I am tid %llu)\n",
             pfn, prev, tid);
         DebugBreak();
-    }
-}
-
-// Lock a specific pfn for removal, escalating under contention. Returns TRUE with the frame
-// locked and the srw held (mode in *exclusive); FALSE if the frame is contended (an inserter
-// holds it), in which case nothing is held and the caller should retry.
-// NOTE: the escalated path TryEnters the frame lock -- never blocks on it while holding the srw
-// exclusive -- otherwise it would deadlock with inserters that hold pfn->lock then take srw.
-BOOLEAN
-lock_pfn_for_remove(PCONCURRENT_LIST_HEAD list, pfn_metadata* pfn, BOOLEAN* exclusive)
-{
-    AcquireSRWLockShared(&list->srw);
-    for (int attempts = 0; attempts < WINDOW_RETRY_LIMIT; attempts++) {
-        if (try_lock_pfn_window(list, pfn)) { *exclusive = FALSE; return TRUE; }
-    }
-    ReleaseSRWLockShared(&list->srw);          // fall in line behind the exclusive lock
-    AcquireSRWLockExclusive(&list->srw);
-    if (!TryEnterCriticalSection(&pfn->lock)) {
-        ReleaseSRWLockExclusive(&list->srw);
-        return FALSE;                          // contended by an inserter; caller retries
-    }
-    // Under exclusive we're the sole mutator, so the links are stable: verify the frame is still
-    // stitched into a list before the caller unlinks it (matches the shared path's revalidation,
-    // and guards against a frame that was removed but still carries a stale list_type).
-    if (pfn->links.Blink->Flink != &pfn->links || pfn->links.Flink->Blink != &pfn->links) {
-        LeaveCriticalSection(&pfn->lock);
-        ReleaseSRWLockExclusive(&list->srw);
-        return FALSE;
-    }
-    *exclusive = TRUE;
-    return TRUE;
-}
-
-// Unlock current pfn
-VOID
-unlock_pfn_for_remove(PCONCURRENT_LIST_HEAD list, pfn_metadata* pfn, BOOLEAN exclusive)
-{
-    if (exclusive) {
-        LeaveCriticalSection(&pfn->lock);
-        ReleaseSRWLockExclusive(&list->srw);
-    }
-    else {
-        unlock_pfn_window(list, pfn);
-        ReleaseSRWLockShared(&list->srw);
     }
 }
 
@@ -492,9 +431,248 @@ get_pfn_from_fn(ULONG64 fn)
         DebugBreak();
         return NULL;
     }
-
     ASSERT(fn <= max_frame_number);
     return &physical_slots[fn];
+}
+
+// ===========================================================================
+// RWList: pfn-lock + lock-coupling access to a CONCURRENT_LIST_HEAD
+//
+// Protocol: list's SRW gives concurrency: SHARED = many parallel
+// inserters/removers/scanners, EXCLUSIVE = one thread escalated because
+// neighbor lock-coupling failed several times. Each node's PFN lock (or head lock)
+// protects its data: region(pte), list(head_lock), pfn(lock), disc
+
+// SHARED path: under AcquireSRWLockShared, take the neighbor node-locks with
+// TryEnter (not blocked while holding the SRW). Splice while holding the
+// caller's node lock plus both neighbor locks. On LIST_COUPLE_MAX_FAILS
+// consecutive TryEnter misses, release everything and escalate.
+//
+// EXCLUSIVE path: AcquireSRWLockExclusive makes us the sole list mutator (shared holders get drained and new ones are blocked)
+// Makes this dead-lock free since two adjacent removers holding its own node lock need to stop teahoing other.
+// node lock and needing the other's -- deadlock-free.
+//
+// Each remove nulls BOTH links, so a second remove of the same node no-ops instead of corrupting a list.
+// 
+// ---- Scan cursor (Policy B: skip contended locks, never escalate) ----
+// Hand-over-hand walk under SHARED SRW held from beginning to end
+// A contended neighbor (TryEnter miss) ends the pass by returning NULL 
+// ===========================================================================
+
+// Map a list entry to the CS guarding its links: the anchor -> head_lock,
+// any real entry -> its pfn lock.
+CRITICAL_SECTION*
+rwlist_node_lock(PCONCURRENT_LIST_HEAD L, PLIST_ENTRY e)
+{
+    if (e == &L->entry) {
+        return &L->head_lock;
+    } 
+    else {
+        return &get_pfn_from_PListEntry(e)->lock;
+    }
+}
+
+// Insert node at the tail
+// Precondition: caller holds node->lock and node->links
+// Flink == node->links
+// Blink == NULL
+VOID
+RWListInsertTail(PCONCURRENT_LIST_HEAD L, pfn_metadata* node)
+{
+    int fails = 0;
+    BOOLEAN exclusive = FALSE;
+
+    for (;;) {
+        if (exclusive) {
+            // Sole mutator: the tail is stable, splice without neighbor locks
+            AcquireSRWLockExclusive(&L->srw);
+            PLIST_ENTRY tail = L->entry.Blink;
+            node->links.Flink = &L->entry;
+            node->links.Blink = tail;
+            tail->Flink = &node->links;
+            L->entry.Blink = &node->links;
+            InterlockedIncrement64(&L->list_count);
+            ReleaseSRWLockExclusive(&L->srw);
+            return;
+        }
+
+        AcquireSRWLockShared(&L->srw);
+        BOOLEAN ok = FALSE;
+        // head_lock guards the anchor's Blink (the tail pointer)
+        // once the lock is held, the tale is stable and every tail-end mutation takes head_lock
+        if (TryEnterCriticalSection(&L->head_lock)) {
+            PLIST_ENTRY tail = L->entry.Blink;
+            CRITICAL_SECTION* tail_l = rwlist_node_lock(L, tail);
+            BOOLEAN dedup = (tail_l == &L->head_lock);   // empty list: tail == anchor
+            if (dedup || TryEnterCriticalSection(tail_l)) {
+                node->links.Flink = &L->entry;
+                node->links.Blink = tail;
+                tail->Flink = &node->links;
+                L->entry.Blink = &node->links;
+                InterlockedIncrement64(&L->list_count);
+                if (!dedup) LeaveCriticalSection(tail_l);
+                LeaveCriticalSection(&L->head_lock);
+                ok = TRUE;
+            }
+            else {
+                LeaveCriticalSection(&L->head_lock);
+            }
+        }
+        ReleaseSRWLockShared(&L->srw);
+        if (ok) return;
+        if (++fails >= LIST_COUPLE_MAX_FAILS) exclusive = TRUE;
+    }
+}
+
+// Remove a node the caller already owns
+// Precondition: caller holds node lock for the entire call
+VOID
+RWListRemoveKnown(PCONCURRENT_LIST_HEAD L, pfn_metadata* node)
+{
+    if (node->links.Flink == NULL) return;   // already off any list
+
+    int fails = 0;
+    BOOLEAN exclusive = FALSE;
+
+    for (;;) {
+        // node->links are stable under node->lock (no neighbor operations without node lock)
+        PLIST_ENTRY flink = node->links.Flink;
+        PLIST_ENTRY blink = node->links.Blink;
+
+        if (exclusive) {
+            // Under exclusive SRW lock, only thread changing
+            AcquireSRWLockExclusive(&L->srw);
+            blink->Flink = flink;
+            flink->Blink = blink;
+            node->links.Flink = NULL;
+            node->links.Blink = NULL;
+            InterlockedDecrement64(&L->list_count);
+            ReleaseSRWLockExclusive(&L->srw);
+            return;
+        }
+
+        AcquireSRWLockShared(&L->srw);
+        CRITICAL_SECTION* flink_lock = rwlist_node_lock(L, flink);
+        CRITICAL_SECTION* blink_lock = rwlist_node_lock(L, blink);
+        BOOLEAN ok = FALSE;
+        if (TryEnterCriticalSection(flink_lock)) {
+            BOOLEAN solo = (blink_lock == flink_lock);   // single-element list
+            if (solo || TryEnterCriticalSection(blink_lock)) {
+                blink->Flink = flink;
+                flink->Blink = blink;
+                node->links.Flink = NULL;
+                node->links.Blink = NULL;
+                InterlockedDecrement64(&L->list_count);
+                if (!solo) LeaveCriticalSection(blink_lock);
+                LeaveCriticalSection(flink_lock);
+                ok = TRUE;
+            }
+            else {
+                LeaveCriticalSection(blink_lock);
+            }
+        }
+        ReleaseSRWLockShared(&L->srw);
+        if (ok) return;
+        if (++fails >= LIST_COUPLE_MAX_FAILS) exclusive = TRUE;
+    }
+}
+
+// Advance one node forward/backward
+// Returns new pfn or NULL if the walk reached the anchor (done) or hit a contended node (stop)
+static pfn_metadata*
+rwlist_scan_advance(RW_LIST_CURSOR* c)
+{
+    PCONCURRENT_LIST_HEAD L = c->list;
+    PLIST_ENTRY next = c->forward ? c->cur->Flink : c->cur->Blink;
+    if (next == &L->entry) {
+        return NULL;   // wrapped to the anchor: end of list
+    }
+    CRITICAL_SECTION* next_l = rwlist_node_lock(L, next);
+    if (!TryEnterCriticalSection(next_l)) {
+        return NULL;   // contended so stop this pass (Policy B)
+    }
+    // Shift the window forward so old curr becomes blink
+    // Drop the old blink lock
+    if (c->prev_lock != c->cur_lock) {
+        LeaveCriticalSection(c->prev_lock);
+    }
+    c->prev = c->cur;
+    c->prev_lock = c->cur_lock;
+    c->cur = next;
+    c->cur_lock = next_l;
+    return get_pfn_from_PListEntry(next);
+}
+
+// Begin a scan and holds SRW shared and locks the anchor as the initial prev==cur 
+// Advances to and returns the first real node (NULL if empty or the first node is contended)
+pfn_metadata*
+RWListScanBegin(PCONCURRENT_LIST_HEAD L, RW_LIST_CURSOR* c, BOOLEAN forward)
+{
+    c->list = L;
+    c->forward = forward;
+    AcquireSRWLockShared(&L->srw);
+    c->prev = &L->entry;
+    c->prev_lock = &L->head_lock;
+    c->cur = &L->entry;
+    c->cur_lock = &L->head_lock;   // prev==cur==anchor: head_lock held once
+    EnterCriticalSection(&L->head_lock);   // bounded: head_lock holders never block
+    return rwlist_scan_advance(c);
+}
+
+// Advance to and return the next node or NULL if end of list / contended
+pfn_metadata*
+RWListScanNext(RW_LIST_CURSOR* c)
+{
+    return rwlist_scan_advance(c);
+}
+
+// Remove cur node and TRANSFER its lock to the caller 
+// On success the returned pfn is still locked and the cursor no longer owns it (caller must unlock)
+// Needs prev (held), cur (held), but if next is contended, returns NULL
+pfn_metadata*
+RWListScanRemoveCurrent(RW_LIST_CURSOR* c)
+{
+    PCONCURRENT_LIST_HEAD L = c->list;
+    if (c->cur == &L->entry) return NULL;   // not positioned on a real node
+
+    PLIST_ENTRY cur = c->cur;
+    PLIST_ENTRY next = c->forward ? cur->Flink : cur->Blink;
+    PLIST_ENTRY prev = c->forward ? cur->Blink : cur->Flink;
+    CRITICAL_SECTION* next_lock = rwlist_node_lock(L, next);
+
+    // Indicate whether single-element list or not
+    BOOLEAN need_next = (next_lock != c->prev_lock && next_lock != c->cur_lock);
+    if (need_next && !TryEnterCriticalSection(next_lock)) {
+        return NULL;   // leave cursor intact even if next is contended
+    }
+
+    // Unlink cur
+    cur->Blink->Flink = cur->Flink;
+    cur->Flink->Blink = cur->Blink;
+    cur->Flink = NULL;
+    cur->Blink = NULL;
+    InterlockedDecrement64(&L->list_count);
+    if (need_next) LeaveCriticalSection(next_lock);
+
+    pfn_metadata* removed = get_pfn_from_PListEntry(cur);
+
+    // Collapse the window onto prev and keep it locked
+    // Call cur prev for advancement
+    // cur_lock is still held by caller 
+    c->cur = c->prev;
+    c->cur_lock = c->prev_lock;
+    return removed;
+}
+
+// At the end of a scan, release cur and prev locks and the SRW
+VOID
+RWListScanEnd(RW_LIST_CURSOR* c)
+{
+    if (c->cur_lock != c->prev_lock) {
+        LeaveCriticalSection(c->cur_lock);
+    }
+    LeaveCriticalSection(c->prev_lock);
+    ReleaseSRWLockShared(&c->list->srw);
 }
 
 // Getting page candidates to unmap and trim them
@@ -540,9 +718,8 @@ get_unmap_candidates_and_trim(int* batch_count, INT batch_size)
                     continue;   // frame busy; skip this victim
                 }
 
-                // RE-CHECK 1: the PTE snapshot above was taken before we held the
-                // list locks, so redo the read-decide now that we hold them
-                // Disc writer could have already grabbed the page
+                // Recheck: the PTE snapshot above was taken before we held the list locks
+                // Redo the read-decide now that we hold them since disc writer could have already grabbed the page
                 PTE fresh;
                 *(ULONG64*)&fresh = *(volatile ULONG64*)pte;
                 if (fresh.hardware.valid != 1 ||
@@ -567,12 +744,12 @@ get_unmap_candidates_and_trim(int* batch_count, INT batch_size)
                 unmap_pfns[*batch_count] = pfn;
                 (*batch_count)++;
 
-                // Move frame to modified list (active pages are on no list)
-                pfn->state.list_type = LIST_MODIFIED;
-                AcquireSRWLockExclusive(&modifiedList_head.srw);
-                InsertTailList(&modifiedList_head.entry, &pfn->links);
-                InterlockedIncrement64(&modifiedList_head.list_count);
-                ReleaseSRWLockExclusive(&modifiedList_head.srw);
+                // Move frame to modified list (active pages are on no list). pfn->lock is
+                // already held; the frame is on no list so its links are the NULL sentinel.
+                // RWListInsertTail does the list_count increment.
+                ASSERT(pfn->links.Flink == NULL && pfn->links.Blink == NULL);
+                pfn_state_set_list_type(pfn, LIST_MODIFIED);
+                RWListInsertTail(&modifiedList_head, pfn);
 
                 LeaveCriticalSection(&pfn->lock);
                 trimmed++;
@@ -647,13 +824,19 @@ get_pfn_from_zero(VOID)
     LeaveCriticalSection(&zeroList_head.list_lock);
     pfn_metadata* pfn = get_pfn_from_PListEntry(entry);
 
+    // Off the zero list so now owned/in-transit and null its links
+    pfn->links.Flink = NULL;
+    pfn->links.Blink = NULL;
+
     // DEBUG: catch double-allocation at the source
+#if DEBUG
     ULONG64 tid = GetCurrentThreadId();
     ULONG64 prev_owner = InterlockedCompareExchange64((LONG64 volatile*)&pfn->owner_thread_id, tid, 0);
     if (prev_owner != 0) {
         printf("BUG: get_pfn_from_free handed out pfn %p already owned by tid %llu (I am tid %llu)\n", pfn, prev_owner, tid);
         DebugBreak();
     }
+#endif
     return pfn;
 }
 
@@ -678,6 +861,10 @@ get_pfn_from_free(VOID)
     pfn_metadata* pfn = cache->pages[--cache->count];
     cache->pages[cache->count] = NULL;
     InterlockedDecrement64(&cached_pages);
+    // Off the free shard/cache, now owned/in-transit: restore the not-on-any-list sentinel
+    // so a later RWListInsertTail (once active and trimmed) sees NULL links.
+    pfn->links.Flink = NULL;
+    pfn->links.Blink = NULL;
 
     // DEBUG: catch double-allocation at the source
     ULONG64 tid = GetCurrentThreadId();
@@ -689,58 +876,67 @@ get_pfn_from_free(VOID)
     return pfn;
 }
 
+// Atomically rescue and remove current standby node by locking next pfn and rescuing cur pfn (repoints PTE to disc)
+// Transfers removed node's lock to caller and returns removed/claimed pfn (still locked) or NULL (revert changes)
+// Lock next pfn first to prevent stranded rescued frame on standby and rescue-success implies remove-success 
+static pfn_metadata*
+rwlist_scan_rescue_remove(RW_LIST_CURSOR* c)
+{
+    PCONCURRENT_LIST_HEAD L = c->list;
+    if (c->cur == &L->entry) return NULL;
+
+    PLIST_ENTRY cur = c->cur;
+    CRITICAL_SECTION* next_lock = rwlist_node_lock(L, cur->Flink);
+    BOOLEAN need_next = (next_lock != c->prev_lock && next_lock != c->cur_lock);
+    if (need_next && !TryEnterCriticalSection(next_lock)) {
+        return NULL;   // next contended: leave the node on standby
+    }
+
+    pfn_metadata* pfn = get_pfn_from_PListEntry(cur);
+    if (!rescue_standby_to_disc(pfn)) {
+        if (need_next) LeaveCriticalSection(next_lock);
+        return NULL;   // region contended: leave the node on standby
+    }
+
+    // Unlink cur (prev, cur, next locks all held), null links, decrement
+    cur->Blink->Flink = cur->Flink;
+    cur->Flink->Blink = cur->Blink;
+    cur->Flink = NULL;
+    cur->Blink = NULL;
+    InterlockedDecrement64(&L->list_count);
+    if (need_next) LeaveCriticalSection(next_lock);
+
+    claim_rescued_pfn(pfn);   // list_type = NONE (stamp owner)
+
+    // Collapse the window onto prev and transfer cur_lock to the caller
+    c->cur = c->prev;
+    c->cur_lock = c->prev_lock;
+    return pfn;
+}
+
 // Rescue a free frame from standby list in its disc state
 pfn_metadata*
 get_pfn_from_standby(VOID)
 {
-    pfn_metadata* result = NULL;
-    BOOLEAN exclusive = FALSE;
+    RW_LIST_CURSOR cur;
 
-    AcquireSRWLockShared(&standbyList_head.srw);
-    PLIST_ENTRY entry = standbyList_head.entry.Flink;
-
-    // Go through the entire standby list
-    while (entry != &standbyList_head.entry) {
-        pfn_metadata* pfn = get_pfn_from_PListEntry(entry);
-
-        // Lock this frame: shared window with retries, else fall in line under the exclusive srw
-        if (!exclusive) {
-            int attempts = 0;
-            while (attempts < WINDOW_RETRY_LIMIT && !try_lock_pfn_window(&standbyList_head, pfn)) {
-                attempts++;
+    // Walk standby forward under shared SRW (Policy B)
+    // On an eligible node, rescue and remove atomically then unlock its transferred lock
+    for (pfn_metadata* pfn = RWListScanBegin(&standbyList_head, &cur, TRUE);
+         pfn != NULL;
+         pfn = RWListScanNext(&cur)) {
+        if (pfn->state.list_type == LIST_STANDBY && !pfn->state.being_written) {
+            pfn_metadata* got = rwlist_scan_rescue_remove(&cur);
+            if (got != NULL) {
+                RWListScanEnd(&cur);   // releases prev + SRW (we still own got_lock)
+                unlock_pfn(got);
+                return got;
             }
-            if (attempts == WINDOW_RETRY_LIMIT) {
-                ReleaseSRWLockShared(&standbyList_head.srw);
-                AcquireSRWLockExclusive(&standbyList_head.srw);
-                exclusive = TRUE;
-                entry = standbyList_head.entry.Flink;
-                // restart walk with plain locks
-                continue;
-            }
+            // next / region contended so skip this node and keep scanning
         }
-        else {
-            EnterCriticalSection(&pfn->lock);
-        }
-        PLIST_ENTRY next = pfn->links.Flink;   // stable: we hold pfn->lock
-
-        if (pfn->state.list_type == LIST_STANDBY && !pfn->state.being_written && rescue_standby_to_disc(pfn)) {
-            RemoveEntryList(&pfn->links);
-            InterlockedDecrement64(&standbyList_head.list_count);
-            claim_rescued_pfn(pfn);
-            result = pfn;
-            if (exclusive) LeaveCriticalSection(&pfn->lock);
-            else unlock_pfn_window(&standbyList_head, pfn);
-            break;
-        }
-
-        if (exclusive) LeaveCriticalSection(&pfn->lock);
-        else unlock_pfn_window(&standbyList_head, pfn);
-        entry = next;
     }
-
-    if (exclusive) ReleaseSRWLockExclusive(&standbyList_head.srw);
-    else ReleaseSRWLockShared(&standbyList_head.srw);
-    return result;
+    RWListScanEnd(&cur);
+    return NULL;
 }
 
 
@@ -1229,38 +1425,37 @@ handle_soft_fault(PVOID arbitrary_va)
         LeaveCriticalSection(region);
         return FALSE;
     }
-    PCONCURRENT_LIST_HEAD list_head = (lt == LIST_STANDBY) ? &standbyList_head : &modifiedList_head;
 
-    BOOLEAN exclusive;
-    if (!lock_pfn_for_remove(list_head, pfn, &exclusive)) {
-        // Frame is held by an inserter mid-transition; retry the fault from the top
+    // Hold pfn->lock across the entire removal (region -> pfn order preserved; the
+    // list SRW + neighbor locks are taken inside RWListRemoveKnown, which only ever
+    // TryEnters cross-node locks, so pfn-then-list here cannot deadlock).
+    EnterCriticalSection(&pfn->lock);
+
+    // Re-read list_type authoritatively under the frame lock.
+    ULONG64 lt2 = pfn->state.list_type;
+    if ((lt2 != LIST_MODIFIED && lt2 != LIST_STANDBY) || pfn->state.being_written) {
+        // Frame moved lists / went mid-write between the peek and the lock: bail.
+        LeaveCriticalSection(&pfn->lock);
         LeaveCriticalSection(region);
         return FALSE;
     }
+    PCONCURRENT_LIST_HEAD list_head = (lt2 == LIST_STANDBY) ? &standbyList_head : &modifiedList_head;
 
-    // Reread under frame lock
-    if (pfn->state.list_type != lt || pfn->state.being_written) {
-        // Frame moved lists between our read and the lock so bail
-        unlock_pfn_for_remove(list_head, pfn, exclusive);
-        LeaveCriticalSection(region);
-        return FALSE;
-    }
     // Set invalid disk slot if from standby list
-    if (lt == LIST_STANDBY) {
+    if (lt2 == LIST_STANDBY) {
         return_disk_free_slots(pfn->disc_index); // clears disc_slot_owner
         InterlockedIncrement64(&disk_debug[2]);
     }
-    // Remove from list previously on
-    RemoveEntryList(&pfn->links);
-    ASSERT(list_head->list_count != 0);
-    InterlockedDecrement64(&list_head->list_count);
-    // Mark it off any list BEFORE dropping the lock. Otherwise a concurrent fault on the same
-    // frame (PTE still in transition) sees the stale list_type, escalates, and tries to unlink
-    // an already-removed page -> corrupts the list.
-    pfn->state.list_type = LIST_NONE;
-    unlock_pfn_for_remove(list_head, pfn, exclusive);
 
-    // Align VA and map to frame
+    // Remove from the list it is on (RWListRemoveKnown does the list_count decrement
+    // and nulls both links, so a concurrent fault seeing a stale list_type no-ops
+    // its own remove instead of corrupting the list).
+    RWListRemoveKnown(list_head, pfn);
+    // Mark it off any list. A concurrent fault peeks list_type without the lock;
+    // LIST_NONE makes it bail early (or block on us then re-read and bail).
+    pfn_state_set_list_type(pfn, LIST_NONE);
+
+    // Align VA and map to frame (still holding pfn->lock and region)
     PULONG_PTR page_aligned_va = (PVOID)((ULONG_PTR)arbitrary_va & ~(PAGE_SIZE - 1));
     if (MapUserPhysicalPages(page_aligned_va, 1, &frame) == FALSE) {
         printf("handle_page_fault: rescue remap failed\n");
@@ -1270,11 +1465,8 @@ handle_soft_fault(PVOID arbitrary_va)
     //validate_page_contents(page_aligned_va, "handle_soft_fault");
 #endif
 
-    // Reacquire lock to finish putting page back on active list
-    EnterCriticalSection(&pfn->lock);
-
-    // Edit PFN
-    pfn->state.list_type = LIST_ACTIVE;
+    // Finish putting page back on the active list (pfn->lock still held)
+    pfn_state_set_list_type(pfn, LIST_ACTIVE);
     pfn->pte = pte; // ZSPFN
     // Edit PTE
     set_pte_valid(pte, frame, 1);
@@ -1365,7 +1557,7 @@ handle_hard_fault(PVOID arbitrary_va)
             // Another thread has restored this page so give frame back to free list
             EnterCriticalSection(&sh->list_lock);
             // ZS batch write this
-            new_pfn->state.list_type = LIST_NONE;
+            pfn_state_set_list_type(new_pfn, LIST_NONE);
             new_pfn->disc_index = INVALID_DISC_SLOT;
             new_pfn->owner_thread_id = 0;
             new_pfn->is_zero = 0;                       // free list holds garbage
@@ -1380,7 +1572,7 @@ handle_hard_fault(PVOID arbitrary_va)
             // Return frame like above
             EnterCriticalSection(&sh->list_lock);
             // ZS batch write this
-            new_pfn->state.list_type = LIST_NONE;
+            pfn_state_set_list_type(new_pfn, LIST_NONE);
             new_pfn->disc_index = INVALID_DISC_SLOT;
             new_pfn->owner_thread_id = 0;
             new_pfn->is_zero = 0;                       // free list holds garbage
@@ -1442,8 +1634,8 @@ handle_hard_fault(PVOID arbitrary_va)
 
         // STEP 5: set to active state and update metadata
         // Insert onto active list and set as valid
-        new_pfn->state.being_written = 0;
-        new_pfn->state.list_type = LIST_ACTIVE;
+        pfn_state_set_being_written(new_pfn, 0);
+        pfn_state_set_list_type(new_pfn, LIST_ACTIVE);
         new_pfn->is_zero = 0;
         new_pfn->pte = pte;
         new_pfn->owner_thread_id = 0;  
@@ -1468,58 +1660,38 @@ write_modified_list(VOID)
     ULONG64 slots[WRITE_BATCH];
     ULONG count = 0;
 
-    // Step 1: collect a batch off the modified list
-    BOOLEAN exclusive = FALSE;
-    AcquireSRWLockShared(&modifiedList_head.srw);
-    PLIST_ENTRY entry = modifiedList_head.entry.Flink;
-
-    while (count < WRITE_BATCH && entry != &modifiedList_head.entry) {
-        // Grab page off modified list and mark as in transition
-        pfn_metadata* pfn = get_pfn_from_PListEntry(entry);
-        if (!exclusive) {
-            int attempts = 0;
-            while (attempts < WINDOW_RETRY_LIMIT && !try_lock_pfn_window(&modifiedList_head, pfn)) {
-                attempts++;
-            }
-            if (attempts == WINDOW_RETRY_LIMIT) {
-                ReleaseSRWLockShared(&modifiedList_head.srw);
-                AcquireSRWLockExclusive(&modifiedList_head.srw);
-                exclusive = TRUE;
-                entry = modifiedList_head.entry.Flink;
-                continue;
-            }
-        }
-        else {
-            EnterCriticalSection(&pfn->lock);
-        }
-
-        PLIST_ENTRY next = pfn->links.Flink;
-
+    // Step 1: collect a batch off the modified list. Walk forward under shared SRW
+    // (Policy B). For an eligible frame, RESERVE it (grab a disc slot + set being_written)
+    // BEFORE removing, then RWListScanRemoveCurrent. The slot + being_written are cleanly
+    // reversible, so if the removal loses the successor race we undo them and skip, leaving
+    // the frame on modified -- unlike the standby rescue, no atomic-with-rescue op is needed.
+    RW_LIST_CURSOR cur;
+    for (pfn_metadata* pfn = RWListScanBegin(&modifiedList_head, &cur, TRUE);
+         pfn != NULL && count < WRITE_BATCH;
+         pfn = RWListScanNext(&cur)) {
         if (pfn->state.list_type == LIST_MODIFIED && !pfn->state.being_written) {
             ULONG64 slot = get_disk_free_slots();
             if (slot == (ULONG64)-1) {
                 // disk full: leave this frame on modified and stop collecting
-                if (exclusive) LeaveCriticalSection(&pfn->lock);
-                else unlock_pfn_window(&modifiedList_head, pfn);
                 SetEvent(redoFault_event);
                 break;
             }
-            pfn->state.being_written = 1;
-            RemoveEntryList(&pfn->links);
-
-            InterlockedDecrement64(&modifiedList_head.list_count);
-            pfns[count] = pfn;
-            frames[count] = pfn->frame_number;
+            pfn_state_set_being_written(pfn, 1);
+            pfn_metadata* removed = RWListScanRemoveCurrent(&cur);
+            if (removed == NULL) {
+                // successor contended: undo the reservation, leave frame on modified
+                pfn_state_set_being_written(pfn, 0);
+                return_disk_free_slots(slot);
+                continue;
+            }
+            pfns[count] = removed;
+            frames[count] = removed->frame_number;
             slots[count] = slot;
             count++;
+            unlock_pfn(removed);   // transferred lock; frame is off modified with being_written=1
         }
-
-        if (exclusive) LeaveCriticalSection(&pfn->lock);
-        else unlock_pfn_window(&modifiedList_head, pfn);
-        entry = next;
     }
-    if (exclusive) ReleaseSRWLockExclusive(&modifiedList_head.srw);
-    else ReleaseSRWLockShared(&modifiedList_head.srw);
+    RWListScanEnd(&cur);
 
     // Step 2: batch map, c amount of copies, batch unmap
     if (count > 0) {
@@ -1579,13 +1751,13 @@ write_modified_list(VOID)
                 continue;
             }
             pfns[i]->disc_index = slots[i];
-            pfns[i]->state.being_written = 0;
-            pfns[i]->state.list_type = LIST_STANDBY;
+            pfn_state_set_being_written(pfns[i], 0);
+            pfn_state_set_list_type(pfns[i], LIST_STANDBY);
 
-            AcquireSRWLockExclusive(&standbyList_head.srw);
-            InsertTailList(&standbyList_head.entry, &pfns[i]->links);
-            InterlockedIncrement64(&standbyList_head.list_count);
-            ReleaseSRWLockExclusive(&standbyList_head.srw);
+            // Frame was pulled off modified during collection (Step 1), which nulls its
+            // links, so it carries the NULL sentinel here. pfn->lock is held.
+            ASSERT(pfns[i]->links.Flink == NULL && pfns[i]->links.Blink == NULL);
+            RWListInsertTail(&standbyList_head, pfns[i]);
             LeaveCriticalSection(&pfns[i]->lock);
         }
         // Signal fault threads that standby has pages
@@ -1621,48 +1793,27 @@ zero_pfns(PULONG_PTR batch_base)
     // as garbage (and get zeroed onto the zero list on a later pass).
     ULONG from_free = count;
 
-    // Step 2: claim frames off of standby list via rescue-to-disc steps
-    BOOLEAN exclusive = FALSE;
-    AcquireSRWLockShared(&standbyList_head.srw);
-    PLIST_ENTRY entry = standbyList_head.entry.Flink;
-    // Standby list checks
-    while (count < WRITE_BATCH && entry != &standbyList_head.entry) {
-        pfn_metadata* pfn = get_pfn_from_PListEntry(entry);
-        // Parallel access to standby list
-        if (!exclusive) {
-            int attempts = 0;
-            while (attempts < WINDOW_RETRY_LIMIT && !try_lock_pfn_window(&standbyList_head, pfn)) {
-                attempts++;
-            }
-            if (attempts == WINDOW_RETRY_LIMIT) {
-                ReleaseSRWLockShared(&standbyList_head.srw);
-                AcquireSRWLockExclusive(&standbyList_head.srw);
-                exclusive = TRUE;
-                entry = standbyList_head.entry.Flink;
-                continue;
+    // Step 2: claim frames off the standby list via the atomic rescue-to-disc scan.
+    // Each rescued node's lock is transferred to us; unlock it once collected (it is
+    // claimed and off every list, so nothing else can reach it).
+    {
+        RW_LIST_CURSOR cur;
+        for (pfn_metadata* pfn = RWListScanBegin(&standbyList_head, &cur, TRUE);
+             pfn != NULL && count < WRITE_BATCH;
+             pfn = RWListScanNext(&cur)) {
+            if (pfn->state.list_type == LIST_STANDBY && !pfn->state.being_written) {
+                pfn_metadata* got = rwlist_scan_rescue_remove(&cur);
+                if (got != NULL) {
+                    pfns[count] = got;
+                    frames[count] = got->frame_number;
+                    count++;
+                    unlock_pfn(got);   // transferred lock; done touching it here
+                }
+                // successor / region contended: skip, keep scanning
             }
         }
-        else {
-            EnterCriticalSection(&pfn->lock);
-        }
-        PLIST_ENTRY next = pfn->links.Flink;
-        // Rescue standby pages
-        if (pfn->state.list_type == LIST_STANDBY && !pfn->state.being_written &&
-            rescue_standby_to_disc(pfn)) {
-            RemoveEntryList(&pfn->links);
-            InterlockedDecrement64(&standbyList_head.list_count);
-            claim_rescued_pfn(pfn);
-            pfns[count] = pfn;
-            frames[count] = pfn->frame_number;
-            count++;
-        }
-
-        if (exclusive) LeaveCriticalSection(&pfn->lock);
-        else unlock_pfn_window(&standbyList_head, pfn);
-        entry = next;
+        RWListScanEnd(&cur);
     }
-    if (exclusive) ReleaseSRWLockExclusive(&standbyList_head.srw);
-    else ReleaseSRWLockShared(&standbyList_head.srw);
     if (count == 0) return 0;
 
     // Step 3: zero only the free-shard pages (map, memset, unmap); standby-rescued pages stay garbage
@@ -1687,7 +1838,7 @@ zero_pfns(PULONG_PTR batch_base)
             pfns[i]->is_zero = 1;
             pfns[i]->pte = NULL;
             pfns[i]->disc_index = INVALID_DISC_SLOT;
-            pfns[i]->state.list_type = LIST_NONE;
+            pfn_state_set_list_type(pfns[i], LIST_NONE);
             pfns[i]->owner_thread_id = 0;               // release so consumer re-claims
             InsertTailList(&zeroList_head.entry, &pfns[i]->links);
             InterlockedIncrement64(&zeroList_head.list_count);
@@ -1703,7 +1854,7 @@ zero_pfns(PULONG_PTR batch_base)
             pfns[i]->is_zero = 0;                       // free list holds garbage
             pfns[i]->pte = NULL;
             pfns[i]->disc_index = INVALID_DISC_SLOT;
-            pfns[i]->state.list_type = LIST_NONE;
+            pfn_state_set_list_type(pfns[i], LIST_NONE);
             pfns[i]->owner_thread_id = 0;               // release so consumer re-claims
             InsertTailList(&sh->entry, &pfns[i]->links);
             InterlockedIncrement64(&sh->list_count);

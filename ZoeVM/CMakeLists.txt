@@ -6,3 +6,4 @@
 add_executable (ZoeVM "vm.c" "init.c" "globals.c" "vm.h")
 
 # TODO: Add tests and install targets if needed.
+

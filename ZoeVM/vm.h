@@ -63,17 +63,14 @@
 
 #define MB_MUL                  10
 #define MB_DIV                  1
-#define AGE_EVERY_N_TRIMS       1
-#define PERIOD_MS               1000
-#define SOFT_FAULT_WRITE_WAIT_MS 2   // backoff when a soft fault hits a mid-write frame
 #define AGES                    8
 #define AGE_SLICE_DIVISOR       4
 #define HOT_ZONE_BIAS           10   // 1-in-N cold jumps reach the wide slice; the rest stay in the hot zone
 #define HOT_ZONE_DIVISOR        16   // hot zone = slice / this
-#define AGE_TICK_MS             25      // fixed fast cadence of the age thread
-#define AGE_ALPHA               1.0     // T_sweep = V/(ALPHA*C); >1 ages faster
-#define AGE_TSWEEP_MIN_MS       25     // cap under heavy pressure
-#define AGE_TSWEEP_BASELINE_MS  50
+#define AGE_TICK_MS             25   // fixed fast cadence of the age thread
+#define AGE_ALPHA               1.0  // T_sweep = V/(ALPHA*C); >1 ages faster
+#define AGE_TSWEEP_MIN_MS       25   // cap under heavy pressure
+#define AGE_TSWEEP_BASELINE_MS  50      
 
 #define WORKING_SET_DIVISOR   1     // cold jumps confined to total_pages/this 
 #define HOT_SPOTS             16    // remembered spots per thread
@@ -81,6 +78,8 @@
 #define RECENT_BIAS           2     // 1-in-N of revisits pick from newest 4 
 #define MIN_RUN_PAGES         4
 #define MAX_RUN_PAGES         32
+#define TARGET_REMAINING_S     0.5
+#define MODIFIED_HIGH_WATER    (NUMBER_OF_PHYSICAL_PAGES / 8)
 
 #define STAGE_RING_PAGES     512
 #define SLOT_SCRUB           0
@@ -88,14 +87,11 @@
 #define OFF_WRITE            (OFF_STAGE + STAGE_RING_PAGES)
 #define THREAD_SCRATCH_PAGES (OFF_WRITE + WRITE_BATCH)
 
-#define TARGET_REMAINING_S     0.5
-#define MODIFIED_HIGH_WATER    (NUMBER_OF_PHYSICAL_PAGES / 8)
-
 #define FREE_CACHE_MAX      64                  // per-thread free-page magazine capacity
 #define NUM_FREE_SHARDS     NUM_FAULT_THREADS   // one free-list shard per fault thread (8)
 #define FREE_REFILL_BATCH   32                  // pages pulled from a shard into the cache per refill
 
-#define WINDOW_RETRY_LIMIT  5
+#define LIST_COUPLE_MAX_FAILS 4   // consecutive neighbor-lock fails before a lock-coupled RW op escalates to exclusive
 
 #define DEBUG 1
 #define STATISTICS 1   // 0 = compile out QPC timing in the trim/write hot paths for max speed
@@ -126,6 +122,17 @@ typedef struct _CONCURRENT_LIST_HEAD {
     ULONG64 list_count;           // updated with Interlocked under shared srw
 } CONCURRENT_LIST_HEAD, * PCONCURRENT_LIST_HEAD;
 
+// Hand-over-hand walk cursor for scanning a CONCURRENT_LIST_HEAD under shared access,
+// skipping contended nodes instead of escalating (Policy B)
+typedef struct _RW_LIST_CURSOR {
+    PCONCURRENT_LIST_HEAD list;
+    PLIST_ENTRY       prev;
+    CRITICAL_SECTION* prev_lock;
+    PLIST_ENTRY       cur;
+    CRITICAL_SECTION* cur_lock;
+    BOOLEAN           forward;
+} RW_LIST_CURSOR;
+
 // Struct for our PTEs
 typedef struct _VALID_PTE {
     ULONG64 valid : 1;
@@ -136,16 +143,16 @@ typedef struct _VALID_PTE {
 } VALID_PTE, * PVALID_PTE;
 
 typedef struct _TRANSITION_PTE {
-    ULONG64 valid : 1; // = 0
-    ULONG64 transition : 1; // = 1
+    ULONG64 valid : 1;          // = 0
+    ULONG64 transition : 1;     // = 1
     ULONG64 frame_number : 40;
     ULONG64 reserved : 22;
 } TRANSITION_PTE, * PTRANSITION_PTE;
 
 typedef struct _DISC_PTE {
-    ULONG64 valid : 1; // = 0
-    ULONG64 transition : 1; // = 0
-    ULONG64 disc : 1; // = 1
+    ULONG64 valid : 1;          // = 0
+    ULONG64 transition : 1;     // = 0
+    ULONG64 disc : 1;           // = 1
     ULONG64 disc_index : MAX_DISC_PTE_BITS;
     ULONG64 reserved : 64 - MAX_DISC_PTE_BITS - 3;
 } DISC_PTE, * PDISC_PTE;
@@ -185,9 +192,9 @@ typedef struct _pfn_metadata {
     PPTE pte;
     ULONG64 disc_index : MAX_DISC_PTE_BITS;
     // INVARIANT: state may only be read-decided-written while holding the list lock
-    // for the list named by state.list_type (the source list) AND the list lock for
+    // for the list named by state.list_type (source list) AND the list lock for
     // the destination list, held across the whole read-decide-write. Plain accesses
-    // only -- the locks are the mechanism, there is no lock-free path to this field.
+    // only, the locks are the mechanism, there is no lock-free path to this field.
     PFN_STATE state;
     ULONG64 owner_thread_id;
     BOOLEAN is_zero;
@@ -201,7 +208,7 @@ typedef struct _DISC_METADATA {
 } DISC_METADATA, * PDISC_METADATA;
 
 typedef struct _DISC_REGION {
-    CRITICAL_SECTION lock; // 1 bit?
+    CRITICAL_SECTION lock;      // ZS 1 bit?
     ULONG64 base_slot;
     ULONG64 slot_count;
     ULONG64 free_count;
@@ -235,6 +242,7 @@ typedef struct _THREAD_RNG_STATE {
     ULONG64 s1;
     unsigned int counter;
 } THREAD_RNG_STATE;
+
 
 // ---- Global state (defined in vm.c) ----
 
@@ -319,6 +327,15 @@ VOID InsertTailList(PLIST_ENTRY ListHead, PLIST_ENTRY Entry);
 PLIST_ENTRY RemoveHeadList(PLIST_ENTRY ListHead);
 BOOLEAN RemoveEntryList(PLIST_ENTRY Entry);
 
+// Concurrent-list access: pfn-lock + lock-coupled neighbors under a shared SRW,
+// escalating to exclusive when coupling keeps failing (see vm.c for the protocol).
+VOID RWListInsertTail(PCONCURRENT_LIST_HEAD L, pfn_metadata* node);
+VOID RWListRemoveKnown(PCONCURRENT_LIST_HEAD L, pfn_metadata* node);
+pfn_metadata* RWListScanBegin(PCONCURRENT_LIST_HEAD L, RW_LIST_CURSOR* c, BOOLEAN forward);
+pfn_metadata* RWListScanNext(RW_LIST_CURSOR* c);
+pfn_metadata* RWListScanRemoveCurrent(RW_LIST_CURSOR* c);
+VOID RWListScanEnd(RW_LIST_CURSOR* c);
+
 // Allocation helpers
 PVOID zero_malloc(size_t num_bytes);
 
@@ -402,3 +419,12 @@ DWORD WINAPI periodic_thread(PVOID parameter);
 // Test driver
 VOID full_virtual_memory_test(VOID);
 
+static __forceinline VOID lock_pfn(pfn_metadata* p)   { EnterCriticalSection(&p->lock); }
+static __forceinline VOID unlock_pfn(pfn_metadata* p) { LeaveCriticalSection(&p->lock); }
+
+// Atomic (CAS-loop) mutators for the single shared state.whole word. Every field of
+// pfn_metadata.state is a read-modify-write on that one 8-byte word; different fields are
+// written under different locks on different paths, so plain bitfield assignment tears the
+// word. These update exactly one field and leave the rest intact. Defined in vm.c.
+static __forceinline VOID pfn_state_set_list_type(pfn_metadata* p, ULONG64 lt);
+static __forceinline VOID pfn_state_set_being_written(pfn_metadata* p, ULONG64 bw);
