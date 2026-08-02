@@ -568,7 +568,10 @@ RWListRemoveKnown(PCONCURRENT_LIST_HEAD L, pfn_metadata* node)
                 ok = TRUE;
             }
             else {
-                LeaveCriticalSection(blink_lock);
+                // blink TryEnter failed: we hold flink_lock only (never blink_lock).
+                // Release the lock we actually took -- releasing blink_lock here would
+                // both leak flink_lock and unbalance a CS owned by another thread.
+                LeaveCriticalSection(flink_lock);
             }
         }
         ReleaseSRWLockShared(&L->srw);
