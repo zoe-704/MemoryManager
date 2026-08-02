@@ -93,6 +93,9 @@
 
 #define LIST_COUPLE_MAX_FAILS 4   // consecutive neighbor-lock fails before a lock-coupled RW op escalates to exclusive
 
+#define PREFETCH             1    // pre-emptively map neighboring VAs when a hard fault occurs
+#define PREFETCH_MAX_PAGES   8    // neighbors ahead of the faulting VA to try mapping per hard fault
+
 #define DEBUG 1
 #define STATISTICS 1   // 0 = compile out QPC timing in the trim/write hot paths for max speed
 
@@ -291,6 +294,7 @@ extern volatile LONG64 tick_call;
 extern volatile LONG64 disk_debug[32];
 extern volatile LONG64 hard_fault_count;
 extern volatile LONG64 soft_fault_count;
+extern volatile LONG64 prefetch_count;
 
 // Per-category counter block
 extern MM_STAT g_trim_stat;
@@ -360,7 +364,7 @@ pfn_metadata* get_free_pfn(VOID);
 static ULONG refill_free_cache(FREE_PAGE_CACHE* cache, int shard);
 
 // PTE setters
-VOID set_pte_valid(PPTE pte, ULONG64 frame_number, ULONG64 age);
+VOID set_pte_valid(PPTE pte, ULONG64 frame_number, ULONG64 accessed);
 VOID set_pte_invalid(PPTE pte);
 VOID set_pte_transition(PPTE pte, ULONG64 frame_number);
 VOID set_pte_disc(PPTE pte, ULONG64 disc_index);
@@ -407,6 +411,7 @@ BOOL setup_program(VOID);
 // Fault handling
 BOOLEAN handle_soft_fault(PVOID arbitrary_va);
 BOOL handle_hard_fault(PVOID arbitrary_va);
+VOID prefetch_neighbors(PVOID faulting_va);
 VOID write_modified_list(VOID);
 
 // Thread entry points

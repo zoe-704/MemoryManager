@@ -50,6 +50,7 @@ volatile LONG64 tick_call;
 volatile LONG64 disk_debug[32];
 volatile LONG64 hard_fault_count = 0;
 volatile LONG64 soft_fault_count = 0;
+volatile LONG64 prefetch_count = 0;
 
 // Other globals
 PULONG_PTR VA_SPACE;

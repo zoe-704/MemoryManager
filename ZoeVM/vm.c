@@ -960,6 +960,37 @@ get_free_pfn(VOID)
     return NULL; // caller will signal trimmer and wait
 }
 
+// Frame source for speculative prefetch: only pages already sitting ready on the
+// zero or free lists. It never rescues standby, never trims, and never waits --
+// prefetch is best-effort and must not compete with real faults for scarce pages,
+// so it simply gives up (returns NULL) when no ready page is at hand.
+static pfn_metadata*
+get_prefetch_pfn(VOID)
+{
+    pfn_metadata* pfn = get_pfn_from_zero();
+    if (pfn != NULL) return pfn;
+    return get_pfn_from_free();
+}
+
+// Return an unused frame to this thread's free shard. Used on prefetch bailout when a
+// grabbed frame is no longer needed (neighbor got resolved by someone else, or a
+// later step failed). Mirrors the "give the frame back" path in handle_hard_fault.
+// Caller must NOT hold any PTE region lock.
+static VOID
+prefetch_return_pfn(pfn_metadata* pfn)
+{
+    PLIST_HEAD sh = &freeList_shards[free_shard_for_thread()];
+    EnterCriticalSection(&sh->list_lock);
+    pfn_state_set_list_type(pfn, LIST_NONE);
+    pfn->disc_index = INVALID_DISC_SLOT;
+    pfn->owner_thread_id = 0;
+    pfn->is_zero = 0;                       // free list holds garbage
+    InsertHeadList(&sh->entry, &pfn->links);
+    InterlockedIncrement64(&sh->list_count);
+    LeaveCriticalSection(&sh->list_lock);
+    SetEvent(startZero_event);
+}
+
 // Move up to FREE_REFILL_BATCH pages from one shard into cache
 static ULONG
 refill_free_cache(FREE_PAGE_CACHE* cache, int shard) {
@@ -980,15 +1011,15 @@ refill_free_cache(FREE_PAGE_CACHE* cache, int shard) {
 // Setters
 // Set PTE to its valid state
 VOID
-set_pte_valid(PPTE pte, ULONG64 frame_number, ULONG64 age)
+set_pte_valid(PPTE pte, ULONG64 frame_number, ULONG64 accessed)
 {
     PTE snapshot;
    // ZS use in other places read not necessary here
    // snapshot.entire_contents = ReadULong64NoFence(&pte->entire_contents);
     snapshot.entire_contents = 0;
-   
+
     snapshot.hardware.valid = 1;
-    snapshot.hardware.accessed = 1; // freshly faulted-in page counts as accessed but set 0 to start as cold
+    snapshot.hardware.accessed = accessed ? 1 : 0; // demand faults pass 1 (hot); prefetch passes 0 (cold)
     snapshot.hardware.age = 0; // ZS only age?
     snapshot.hardware.frame_number = frame_number;
     snapshot.hardware.reserved = 0;
@@ -1368,6 +1399,7 @@ print_statistics(VOID)
     ULONG64 stby_c = InterlockedOr64(&standbyList_head.list_count, 0);
     ULONG64 hard = InterlockedOr64(&hard_fault_count, 0);
     ULONG64 soft = InterlockedOr64(&soft_fault_count, 0);
+    ULONG64 prefetched = InterlockedOr64(&prefetch_count, 0);
     ULONG64 faults = hard + soft;
 
     printf("\n---------- STATISTICS ----------\n");
@@ -1379,6 +1411,7 @@ print_statistics(VOID)
         printf("  HARD:     %6llu  (%.1f%%)\n", hard, 100.0 * hard / faults);
         printf("  SOFT:     %6llu  (%.1f%%)\n", soft, 100.0 * soft / faults);
     }
+    printf("  PREFETCH: %6llu\n", prefetched);
     printf("--------------------------------\n\n");
 }
 
@@ -1649,8 +1682,116 @@ handle_hard_fault(PVOID arbitrary_va)
 
         InterlockedIncrement64(&hard_fault_count);
         LeaveCriticalSection(region);
+
+        // Warm the pages just past this one: the workload walks VAs in ascending runs,
+        // so the neighbors ahead are the ones about to be touched (region lock released
+        // first -- prefetch takes the neighbors' own locks independently).
+        prefetch_neighbors(arbitrary_va);
     }
     return TRUE;
+}
+
+// Speculatively map the run of VAs immediately after a hard fault. Because the workload
+// touches pages in ascending runs, the pages just past the faulting one are the ones
+// about to be accessed; mapping them now turns those coming accesses into hits instead
+// of faults. Best-effort and self-throttling: bounded to PREFETCH_MAX_PAGES, pulls frames
+// only from the ready zero/free lists, and stops the instant no ready frame is available,
+// so it never trims, waits, or rescues standby on behalf of a guess. Pages are committed
+// COLD (accessed = 0): if the guess is right the real access sets the accessed bit, and if
+// it is wrong the page ages out normally instead of masquerading as hot.
+VOID
+prefetch_neighbors(PVOID faulting_va)
+{
+#if PREFETCH
+    ULONG64 base_index = get_pte_from_va(faulting_va) - page_table;
+
+    for (ULONG64 k = 1; k <= PREFETCH_MAX_PAGES; k++) {
+        ULONG64 idx = base_index + k;
+        if (idx >= num_ptes) break;                 // past the end of the VA space
+        PPTE pte = page_table + idx;
+
+        // Cheap unlocked peek: only brand-new or disc-backed neighbors (the ones that
+        // would hard-fault) are worth warming. Skip already-valid / in-transition ones,
+        // but keep scanning -- a later neighbor in the run may still be a candidate.
+        PTE peek;
+        peek.entire_contents = *(volatile ULONG64*)pte;
+        if (peek.hardware.valid == 1 || peek.transition.transition == 1) {
+            continue;
+        }
+
+        // Take a frame only if one is already sitting ready; otherwise abandon prefetch
+        // entirely so we never pull pages out from under threads taking real faults.
+        pfn_metadata* new_pfn = get_prefetch_pfn();
+        if (new_pfn == NULL) break;
+
+        PULONG_PTR page_aligned_va = get_va_from_pte(pte);
+        PPTE_REGION region_struct = get_pte_region(pte);
+        CRITICAL_SECTION* region = get_pte_lock(pte);
+        EnterCriticalSection(region);
+
+        // Re-check under the region lock: another thread may have faulted this page in,
+        // or begun a rescue, while we were grabbing the frame. If so, hand the frame back.
+        if (pte->hardware.valid == 1 || pte->transition.transition == 1) {
+            LeaveCriticalSection(region);
+            prefetch_return_pfn(new_pfn);
+            continue;
+        }
+
+        BOOL from_disc = pte->disc.disc;
+        ULONG64 old_disc_slot = from_disc ? pte->disc.disc_index : (ULONG64)-1;
+
+        // Disc-backed: restore prior contents through the private staging slot first.
+        if (from_disc) {
+            PULONG_PTR temp_va = stage_ring_map(new_pfn->frame_number);
+            if (temp_va == NULL) {
+                LeaveCriticalSection(region);
+                prefetch_return_pfn(new_pfn);
+                break;
+            }
+
+            memcpy(temp_va, (char*)disc + (old_disc_slot * PAGE_SIZE), PAGE_SIZE);
+
+            ULONG_PTR first = *(PULONG_PTR)temp_va;
+            if (first != 0 && (first & ~(PAGE_SIZE - 1)) != (ULONG_PTR)page_aligned_va) {
+                printf("prefetch: slot %llu holds data for VA %p, expected %p\n",
+                    old_disc_slot, (PVOID)first, page_aligned_va);
+                DebugBreak();
+            }
+
+            return_disk_free_slots(old_disc_slot);
+        }
+
+        // Expose at the real VA.
+        if (MapUserPhysicalPages(page_aligned_va, 1, &new_pfn->frame_number) == FALSE) {
+            printf("prefetch: could not map VA %p to frame %llX, err %lu\n",
+                page_aligned_va, new_pfn->frame_number, GetLastError());
+            LeaveCriticalSection(region);
+            DebugBreak();
+            break;
+        }
+
+        // A brand-new frame we did not overwrite from disc may hold garbage: scrub it.
+        if (!from_disc && !new_pfn->is_zero) {
+            memset(page_aligned_va, 0, PAGE_SIZE);
+        }
+
+        // Commit as active but COLD (accessed = 0) -- the app has not touched it yet.
+        pfn_state_set_being_written(new_pfn, 0);
+        pfn_state_set_list_type(new_pfn, LIST_ACTIVE);
+        new_pfn->is_zero = 0;
+        new_pfn->pte = pte;
+        new_pfn->owner_thread_id = 0;
+
+        set_pte_valid(pte, new_pfn->frame_number, 0);   // accessed = 0
+        region_struct->active_page_count++;
+        region_struct->age_counts[0]++;
+
+        InterlockedIncrement64(&prefetch_count);
+        LeaveCriticalSection(region);
+    }
+#else
+    UNREFERENCED_PARAMETER(faulting_va);
+#endif
 }
 
 // Move modified list to disk and push to standby
