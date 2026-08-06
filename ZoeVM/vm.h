@@ -43,8 +43,8 @@
 #define MAX_DISC_SIZE               ((ULONG64) 1 << MAX_DISC_PTE_BITS)
 #define INVALID_DISC_SLOT           ((1ULL << MAX_DISC_PTE_BITS) - 1)
 
-#define NUM_FAULT_THREADS   8
-#define NUM_THREADS         13
+#define NUM_FAULT_THREADS   7
+#define NUM_THREADS         (NUM_FAULT_THREADS + 5)   // 5 workers: trim, disc, age, periodic, zero
 
 #define MAX_TRIM_PAGES  512
 #define MIN_TRIM_BATCH  32
@@ -72,7 +72,7 @@
 #define AGE_TSWEEP_MIN_MS       25   // cap under heavy pressure
 #define AGE_TSWEEP_BASELINE_MS  50      
 
-#define WORKING_SET_DIVISOR   1     // cold jumps confined to total_pages/this 
+#define WORKING_SET_DIVISOR   2     // cold jumps confined to total_pages/this 
 #define HOT_SPOTS             16    // remembered spots per thread
 #define REVISIT_CHANCE        3     // 1-in-N chance of revisiting a hot spot
 #define RECENT_BIAS           2     // 1-in-N of revisits pick from newest 4 
@@ -335,6 +335,7 @@ pfn_metadata* RWListScanBegin(PCONCURRENT_LIST_HEAD L, RW_LIST_CURSOR* c, BOOLEA
 pfn_metadata* RWListScanNext(RW_LIST_CURSOR* c);
 pfn_metadata* RWListScanRemoveCurrent(RW_LIST_CURSOR* c);
 VOID RWListScanEnd(RW_LIST_CURSOR* c);
+VOID check_concurrent_list(PCONCURRENT_LIST_HEAD L, ULONG64 expected_type, const char* name);
 
 // Allocation helpers
 PVOID zero_malloc(size_t num_bytes);
@@ -357,7 +358,7 @@ pfn_metadata* get_pfn_from_free(VOID);
 pfn_metadata* get_pfn_from_standby(VOID);
 pfn_metadata* get_free_pfn(VOID);
 
-static ULONG refill_free_cache(FREE_PAGE_CACHE* cache, int shard);
+ULONG refill_free_cache(FREE_PAGE_CACHE* cache, int shard);
 
 // PTE setters
 VOID set_pte_valid(PPTE pte, ULONG64 frame_number, ULONG64 age);
@@ -426,5 +427,15 @@ static __forceinline VOID unlock_pfn(pfn_metadata* p) { LeaveCriticalSection(&p-
 // pfn_metadata.state is a read-modify-write on that one 8-byte word; different fields are
 // written under different locks on different paths, so plain bitfield assignment tears the
 // word. These update exactly one field and leave the rest intact. Defined in vm.c.
-static __forceinline VOID pfn_state_set_list_type(pfn_metadata* p, ULONG64 lt);
-static __forceinline VOID pfn_state_set_being_written(pfn_metadata* p, ULONG64 bw);
+VOID pfn_state_set_list_type(pfn_metadata* p, ULONG64 lt);
+VOID pfn_state_set_being_written(pfn_metadata* p, ULONG64 bw);
+
+// Cross-file prototypes (split moved these out of vm.c; they are called from other
+// translation units so they need external linkage + a visible prototype here).
+int free_shard_for_thread(VOID);
+PULONG_PTR stage_ring_map(ULONG64 frame_number);
+VOID stage_ring_flush(VOID);
+BOOLEAN rescue_standby_to_disc(pfn_metadata* pfn);
+VOID claim_rescued_pfn(pfn_metadata* pfn);
+pfn_metadata* rwlist_scan_rescue_remove(RW_LIST_CURSOR* c);
+VOID pte_set_accessed(PPTE pte);
