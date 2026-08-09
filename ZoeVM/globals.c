@@ -5,6 +5,7 @@
 // duplicate-symbol link errors, and keeps vm.c to code only.
 
 #include "vm.h"
+#include "globals.h"
 
 // Locks
 ULONG64 NUM_PTE_LOCKS = 0;
@@ -29,6 +30,10 @@ HANDLE shutdown_event;
 PPTE page_table;
 PPTE_REGION pte_regions;
 ULONG64 num_ptes;
+
+// Region-age index (regions bucketed by oldest active page)
+REGION_AGE_LIST region_age_lists[AGES];
+CRITICAL_SECTION region_age_lock;
 
 // Physical frames
 pfn_metadata* physical_slots = NULL;

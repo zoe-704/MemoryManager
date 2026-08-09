@@ -1,44 +1,13 @@
 #include "vm.h"
+#include "pfn.h"
 
-// Atomic single-field updates to the shared pfn->state.whole word
-// list_type is written on list paths
-// being_written is written on writer/commit path 
-// CAS-loop: read the whole word, set field, InterlockedCompareExchange64, and retry on miss
-VOID
-pfn_state_set_list_type(pfn_metadata* p, ULONG64 lt)
-{
-    volatile LONG64* target = (volatile LONG64*)&p->state.whole;
-    for (;;) {
-        PFN_STATE cur, nxt;
-        cur.whole = (ULONG64)*target;
-        nxt = cur;
-        nxt.list_type = lt;
-        if (InterlockedCompareExchange64(target, (LONG64)nxt.whole, (LONG64)cur.whole) == (LONG64)cur.whole) {
-            return;
-        }
-    }
-}
-VOID
-pfn_state_set_being_written(pfn_metadata* p, ULONG64 bw)
-{
-    volatile LONG64* target = (volatile LONG64*)&p->state.whole;
-    for (;;) {
-        PFN_STATE cur, nxt;
-        cur.whole = (ULONG64)*target;
-        nxt = cur;
-        nxt.being_written = bw;
-        if (InterlockedCompareExchange64(target, (LONG64)nxt.whole, (LONG64)cur.whole) == (LONG64)cur.whole) {
-            return;
-        }
-    }
-}
-
-
-// Claim a frame just pulled off standby so no other path can hand it out
+// Claim a frame just pulled off standby so no other path can hand it out.
+// Caller holds pfn->lock (the scan transfers cur_lock == pfn->lock to us), so the
+// plain list_type write below is serialized by the frame lock.
 VOID
 claim_rescued_pfn(pfn_metadata* pfn)
 {
-    pfn_state_set_list_type(pfn, LIST_NONE);   // off standby, in-transit
+    pfn->list_type = LIST_NONE;   // off standby, in-transit
     ULONG64 tid = GetCurrentThreadId();
     ULONG64 prev = InterlockedCompareExchange64((LONG64 volatile*)&pfn->owner_thread_id, tid, 0);
     if (prev != 0) {
@@ -89,9 +58,9 @@ get_pfn_from_zero(VOID)
     // MODIFIED/STANDBY here we caught a double list membership at the second
     // allocation -- trap now (links not yet nulled, so Flink still names the list).
 #if DEBUG
-    if (pfn->state.list_type != LIST_NONE) {
+    if (pfn->list_type != LIST_NONE) {
         printf("BUG: get_pfn_from_zero handed out pfn %p still on list_type=%llu Flink=%p Blink=%p (double membership)\n",
-            pfn, (ULONG64)pfn->state.list_type, pfn->links.Flink, pfn->links.Blink);
+            pfn, (ULONG64)pfn->list_type, pfn->links.Flink, pfn->links.Blink);
         DebugBreak();
     }
 #endif
@@ -142,9 +111,9 @@ get_pfn_from_free(VOID)
     // reads MODIFIED/STANDBY here we caught a double list membership at the second
     // allocation -- trap now (links not yet nulled, so Flink still names the list).
 #if DEBUG
-    if (pfn->state.list_type != LIST_NONE) {
+    if (pfn->list_type != LIST_NONE) {
         printf("BUG: get_pfn_from_free handed out pfn %p still on list_type=%llu Flink=%p Blink=%p (double membership)\n",
-            pfn, (ULONG64)pfn->state.list_type, pfn->links.Flink, pfn->links.Blink);
+            pfn, (ULONG64)pfn->list_type, pfn->links.Flink, pfn->links.Blink);
         DebugBreak();
     }
 #endif
@@ -178,7 +147,7 @@ get_pfn_from_standby(VOID)
     for (pfn_metadata* pfn = RWListScanBegin(&standbyList_head, &cur, TRUE);
         pfn != NULL;
         pfn = RWListScanNext(&cur)) {
-        if (pfn->state.list_type == LIST_STANDBY && !pfn->state.being_written) {
+        if (pfn->list_type == LIST_STANDBY && !pfn->being_written) {
             pfn_metadata* got = rwlist_scan_rescue_remove(&cur);
             if (got != NULL) {
                 RWListScanEnd(&cur);   // releases prev + SRW (we still own got_lock)

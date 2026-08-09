@@ -5,6 +5,7 @@
 // acquisition + physical page / virtual address space allocation).
 
 #include "vm.h"
+#include "init.h"
 
 // Malloc and memset vm to zero
 PVOID
@@ -87,9 +88,9 @@ init_pfn_metadata(
         physical_slots[frame].frame_number = frame;
         physical_slots[frame].pte = NULL;
         physical_slots[frame].disc_index = INVALID_DISC_SLOT;
-        physical_slots[frame].state.list_type = 0;
-        physical_slots[frame].state.being_written = 0;
-        physical_slots[frame].state.accessed = 0;
+        physical_slots[frame].list_type = 0;
+        physical_slots[frame].being_written = 0;
+        physical_slots[frame].accessed = 0;
         physical_slots[frame].owner_thread_id = 0;
         physical_slots[frame].is_zero = 0;
 
@@ -160,12 +161,22 @@ init_pte_regions(
         DebugBreak();
         return;
     }
+    // Region-age index: AGES lists of regions, all empty; regions start on none of them
+    // (REGION_AGE_NONE) because they have no active pages yet.
+    InitializeCriticalSectionAndSpinCount(&region_age_lock, 0x00FFFFFF);
+    for (int age = 0; age < AGES; age++) {
+        InitializeListHead(&region_age_lists[age].head);
+        region_age_lists[age].count = 0;
+    }
+
     for (ULONG64 i = 0; i < NUM_PTE_LOCKS; i++) {
         InitializeCriticalSectionAndSpinCount(&pte_regions[i].lock, 0x00FFFFFF);
         pte_regions[i].active_page_count = 0;
-        for (int age = 0; age < 8; age++) {
+        for (int age = 0; age < AGES; age++) {
+            InitializeListHead(&pte_regions[i].active_age_lists[age]);
             pte_regions[i].age_counts[age] = 0;
         }
+        pte_regions[i].age_list_number = REGION_AGE_NONE;   // no active pages -> on no region-age list
     }
 }
 

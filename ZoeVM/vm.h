@@ -61,7 +61,7 @@
 #define LIST_MODIFIED  2
 #define LIST_STANDBY   3
 
-#define MB_MUL                  10
+#define MB_MUL                  100
 #define MB_DIV                  1
 #define AGES                    8
 #define AGE_SLICE_DIVISOR       4
@@ -78,8 +78,8 @@
 #define RECENT_BIAS           2     // 1-in-N of revisits pick from newest 4 
 #define MIN_RUN_PAGES         4
 #define MAX_RUN_PAGES         32
-#define TARGET_REMAINING_S     0.5
-#define MODIFIED_HIGH_WATER    (NUMBER_OF_PHYSICAL_PAGES / 8)
+#define TARGET_REMAINING_S    0.5
+#define MODIFIED_HIGH_WATER   (NUMBER_OF_PHYSICAL_PAGES / 8)
 
 #define STAGE_RING_PAGES     512
 #define SLOT_SCRUB           0
@@ -93,8 +93,8 @@
 
 #define LIST_COUPLE_MAX_FAILS 4   // consecutive neighbor-lock fails before a lock-coupled RW op escalates to exclusive
 
-#define DEBUG 1
-#define STATISTICS 1   // 0 = compile out QPC timing in the trim/write hot paths for max speed
+#define DEBUG 0
+#define STATISTICS 0   // 0 = compile out QPC timing in the trim/write hot paths for max speed
 
 #if defined(DEBUG)
 #define ASSERT(condition) \
@@ -167,22 +167,37 @@ typedef struct {
     };
 } PTE, * PPTE;
 
+// Region-granular aging + per-region active lists.
+//
+// Coherence invariant: an ACTIVE frame is always on exactly one list -- its region's
+// active_age_lists[age]. The trimmer CLAIMS a frame by RemoveEntryList off that list under
+// region->lock (an ownership handoff), never by dereferencing a PTE's frame number. That is
+// what keeps the modified/standby RWLists fed only coherent frames (VMM's invariant).
+//
+// Two independent indices:
+//   * active_age_lists[age] (+ age_counts[age] = its length) -- the region's ACTIVE frames,
+//     bucketed by age. Guarded by region->lock.
+//   * region_age_lists[age]  -- whole regions bucketed by their OLDEST active page, for fast
+//     trimmer region-selection. Guarded by region_age_lock. A region's age_list_number names
+//     which one it is on, or REGION_AGE_NONE when it has no active pages.
+#define REGION_AGE_NONE   AGES   // region has no active pages -> on no region-age list
+
 // Struct for PTE regions
 typedef struct _PTE_REGION {
     CRITICAL_SECTION lock;
     ULONG64 active_page_count;
-    ULONG64 age_counts[AGES];   // track number of valid PTEs in region with a certain age
+    LIST_ENTRY active_age_lists[AGES];  // this region's ACTIVE frames, bucketed by age
+    ULONG64 age_counts[AGES];           // length of each bucket (O(1) region age)
+    // --- region-age-list membership; guarded by region_age_lock, NOT region->lock ---
+    LIST_ENTRY age_link;                // this region's node on region_age_lists[age_list_number]
+    ULONG64    age_list_number;         // which region-age list, or REGION_AGE_NONE
 } PTE_REGION, * PPTE_REGION;
 
-// Struct for PFN states
-typedef union _PFN_STATE {
-    struct {
-        ULONG64 list_type : 2; 
-        ULONG64 being_written : 1;
-        ULONG64 accessed : 1;
-    };
-    ULONG64 whole;
-} PFN_STATE;
+// One list of REGIONS per age level (regions here all share the same oldest-page age).
+typedef struct _REGION_AGE_LIST {
+    LIST_ENTRY head;
+    ULONG64    count;
+} REGION_AGE_LIST;
 
 // Struct for our PFNs
 typedef struct _pfn_metadata {
@@ -191,11 +206,17 @@ typedef struct _pfn_metadata {
     ULONG64 frame_number;
     PPTE pte;
     ULONG64 disc_index : MAX_DISC_PTE_BITS;
-    // INVARIANT: state may only be read-decided-written while holding the list lock
-    // for the list named by state.list_type (source list) AND the list lock for
-    // the destination list, held across the whole read-decide-write. Plain accesses
-    // only, the locks are the mechanism, there is no lock-free path to this field.
-    PFN_STATE state;
+    // State bits. They pack into the same 8-byte word as disc_index above.
+    // INVARIANT: every field in this word (disc_index, list_type, being_written,
+    // accessed) is only read-decided-written while holding THIS frame's `lock` -- or
+    // while the frame is exclusively owned and off every list (freshly allocated from
+    // free/zero, or just rescued off standby, before it is republished). There is no
+    // lock-free path: the frame lock serializes the whole word, so plain bitfield
+    // writes from different paths cannot tear it. Unlocked reads are peeks only and
+    // are always re-validated under the lock before any decision is committed.
+    ULONG64 list_type : 2;
+    ULONG64 being_written : 1;
+    ULONG64 accessed : 1;
     ULONG64 owner_thread_id;
     BOOLEAN is_zero;
 } pfn_metadata;
@@ -271,6 +292,12 @@ extern PPTE page_table;
 extern PPTE_REGION pte_regions;
 extern ULONG64 num_ptes;
 
+// Region-age index: regions bucketed by their oldest active page. One global lock guards all
+// AGES lists AND every region's age_link / age_list_number (region moves are amortized/rare,
+// so a single lock is right and deadlock-free).
+extern REGION_AGE_LIST region_age_lists[AGES];
+extern CRITICAL_SECTION region_age_lock;
+
 // Represents physical memory slots and used as an array of pointers mapping hardware frame number to metadata block
 extern pfn_metadata* physical_slots;
 extern ULONG64 max_frame_number;
@@ -289,6 +316,7 @@ extern volatile LONG64 va_access_count;
 extern volatile LONG64 loop_iterations;
 extern volatile LONG64 tick_call;
 extern volatile LONG64 disk_debug[32];
+// ZS decelspec global struct
 extern volatile LONG64 hard_fault_count;
 extern volatile LONG64 soft_fault_count;
 
@@ -352,6 +380,16 @@ PULONG_PTR get_va_from_pte(PPTE pte);
 pfn_metadata* get_pfn_from_PListEntry(PLIST_ENTRY entry);
 pfn_metadata* get_pfn_from_fn(ULONG64 fn);
 
+// Region active-list + region-age index helpers.
+// region_add_active: put a just-activated frame onto region->active_age_lists[age].
+//   Caller holds region->lock AND pfn->lock. Re-buckets the region if its oldest age changed.
+// region_oldest_age: highest age with a non-empty bucket, or REGION_AGE_NONE. Caller holds region->lock.
+// region_rebucket: move the region to the region-age list matching its current oldest age.
+//   Caller holds region->lock (reads age_counts); takes region_age_lock internally.
+VOID region_add_active(PPTE_REGION region, pfn_metadata* pfn, ULONG64 age);
+ULONG64 region_oldest_age(PPTE_REGION region);
+VOID region_rebucket(PPTE_REGION region);
+
 // Trim / free-page acquisition
 VOID get_unmap_candidates_and_trim(int* batch_count, INT batch_size);
 pfn_metadata* get_pfn_from_free(VOID);
@@ -380,7 +418,6 @@ VOID return_disk_free_slots(ULONG64 slot);
 BOOLEAN PTE_WasAccessed(PPTE pte);
 VOID PTE_SetAccessedBit(PPTE pte);
 VOID PTE_ClearAccessedBit(PPTE pte);
-VOID AgeListTick(VOID);
 
 // Initialization (init.c)
 VOID init_lists(VOID);
@@ -406,9 +443,11 @@ HANDLE CreateSharedMemorySection(VOID);
 BOOL setup_program(VOID);
 
 // Fault handling
-BOOLEAN handle_soft_fault(PVOID arbitrary_va);
-BOOL handle_hard_fault(PVOID arbitrary_va);
-VOID write_modified_list(VOID);
+// The faulting VA fully determines pte / region / page-aligned VA, so the caller derives them
+// once and threads them in rather than every handler (and the hard->soft hand-off) recomputing.
+BOOLEAN handle_soft_fault(PVOID arbitrary_va, PPTE pte, PPTE_REGION region_struct, PVOID page_aligned_va);
+BOOL handle_hard_fault(PVOID arbitrary_va, PPTE pte, PPTE_REGION region_struct, PVOID page_aligned_va);
+ULONG write_modified_list(VOID);   // returns # frames drained this pass (0 == nothing eligible)
 
 // Thread entry points
 DWORD WINAPI page_fault_thread(PVOID parameter);
@@ -422,13 +461,6 @@ VOID full_virtual_memory_test(VOID);
 
 static __forceinline VOID lock_pfn(pfn_metadata* p)   { EnterCriticalSection(&p->lock); }
 static __forceinline VOID unlock_pfn(pfn_metadata* p) { LeaveCriticalSection(&p->lock); }
-
-// Atomic (CAS-loop) mutators for the single shared state.whole word. Every field of
-// pfn_metadata.state is a read-modify-write on that one 8-byte word; different fields are
-// written under different locks on different paths, so plain bitfield assignment tears the
-// word. These update exactly one field and leave the rest intact. Defined in vm.c.
-VOID pfn_state_set_list_type(pfn_metadata* p, ULONG64 lt);
-VOID pfn_state_set_being_written(pfn_metadata* p, ULONG64 bw);
 
 // Cross-file prototypes (split moved these out of vm.c; they are called from other
 // translation units so they need external linkage + a visible prototype here).

@@ -1,4 +1,5 @@
 #include "vm.h"
+#include "pte.h"
 
 // Getters
 // Getting pte regions
@@ -91,7 +92,26 @@ set_pte_disc(PPTE pte, ULONG64 disc_index)
     WriteULong64NoFence(&pte->entire_contents, snapshot.entire_contents);
 }
 
-
+// Repurpose a standby frame by pointing its PTE at the disc copy and clearing the frame's pte/disc
+// Caller holds the frame's lock
+BOOLEAN
+rescue_standby_to_disc(pfn_metadata* pfn)
+{
+    PPTE old_pte = pfn->pte;
+    if (old_pte == NULL) {  // standby frame must have a pte
+        DebugBreak();
+        return FALSE;
+    }
+    CRITICAL_SECTION* region = get_pte_lock(old_pte);
+    if (!TryEnterCriticalSection(region)) {
+        return FALSE;
+    }
+    set_pte_disc(old_pte, pfn->disc_index);
+    pfn->pte = NULL;
+    pfn->disc_index = INVALID_DISC_SLOT;
+    LeaveCriticalSection(region);
+    return TRUE;
+}
 
 // Age stuff
 VOID
