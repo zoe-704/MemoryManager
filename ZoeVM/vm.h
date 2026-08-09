@@ -48,7 +48,8 @@
 
 #define MAX_TRIM_PAGES  512
 #define MIN_TRIM_BATCH  32
-#define LOW_ZERO_PAGE_THRESHOLD (NUMBER_OF_PHYSICAL_PAGES / 256)
+#define LOW_ZERO_PAGE_THRESHOLD (NUMBER_OF_PHYSICAL_PAGES / 256)   // wake the zero thread below this
+#define ZEROED_LIST_HIGH        (LOW_ZERO_PAGE_THRESHOLD * 4)      // stop zeroing at this reserve
 #define LOW_FREE_PAGE_THRESHOLD (NUMBER_OF_PHYSICAL_PAGES / 64)
 
 #define WRITE_BATCH             64
@@ -94,7 +95,7 @@
 #define LIST_COUPLE_MAX_FAILS 4   // consecutive neighbor-lock fails before a lock-coupled RW op escalates to exclusive
 
 #define DEBUG 0
-#define STATISTICS 0   // 0 = compile out QPC timing in the trim/write hot paths for max speed
+#define STATISTICS 1   // 0 = compile out QPC timing in the trim/write hot paths for max speed
 
 #if defined(DEBUG)
 #define ASSERT(condition) \
@@ -392,9 +393,12 @@ VOID region_rebucket(PPTE_REGION region);
 
 // Trim / free-page acquisition
 VOID get_unmap_candidates_and_trim(int* batch_count, INT batch_size);
-pfn_metadata* get_pfn_from_free(VOID);
+pfn_metadata* get_pfn_from_zero(VOID);
 pfn_metadata* get_pfn_from_standby(VOID);
-pfn_metadata* get_free_pfn(VOID);
+// Hot/cold acquisition: hot path is a lock-free thread-local magazine pop; the cold path refills
+// from the shards / steals from standby. from_disc == the fault overwrites the frame from disc,
+// so it needs no zeros and never touches the zero list.
+pfn_metadata* get_pfn_for_fault(BOOL from_disc);
 
 ULONG refill_free_cache(FREE_PAGE_CACHE* cache, int shard);
 

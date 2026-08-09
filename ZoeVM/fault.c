@@ -126,8 +126,13 @@ handle_hard_fault(PVOID arbitrary_va, PPTE pte, PPTE_REGION region_struct, PVOID
         // Hard fault path since not valid nor transition so need to get a page
         LeaveCriticalSection(region);
 
+        // Allocation-policy hint (a racy read is fine -- it only picks which pool, never affects
+        // correctness): a disc-backed fault overwrites the whole frame from disc, so it needs no
+        // zeros and stays off the zero list; a demand-zero first touch (pte == 0) prefers a
+        // pre-zeroed frame to skip the inline memset.
+        BOOL from_disc_hint = pte->disc.disc;
 
-        new_pfn = get_free_pfn();
+        new_pfn = get_pfn_for_fault(from_disc_hint);
         if (new_pfn != NULL) break;
 
         // Pool is dry. Kick BOTH producers: the trimmer (active -> modified) and the disc
@@ -138,7 +143,7 @@ handle_hard_fault(PVOID arbitrary_va, PPTE pte, PPTE_REGION region_struct, PVOID
         SetEvent(modifiedReady_event);
         ResetEvent(redoFault_event);
 
-        new_pfn = get_free_pfn();
+        new_pfn = get_pfn_for_fault(from_disc_hint);
         if (new_pfn != NULL) break;
 
         // Pool is empty so ask trimmer for pages
@@ -242,9 +247,12 @@ handle_hard_fault(PVOID arbitrary_va, PPTE pte, PPTE_REGION region_struct, PVOID
             return FALSE;
         }
 
-        // Only zero a frame we did NOT just overwrite from disc
+        // Only zero a frame we did NOT just overwrite from disc. Reaching this memset means a
+        // demand-zero fault found the zero reserve empty -- the strongest "I'm starved of zeroed
+        // pages" signal, so wake the zero thread to refill it (demand-driven, not the 1s poll).
         if (!from_disc && !new_pfn->is_zero) {
             memset(page_aligned_va, 0, PAGE_SIZE);
+            SetEvent(startZero_event);
         }
 
         // STEP 5: set to active state and update metadata

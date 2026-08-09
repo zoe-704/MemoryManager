@@ -416,7 +416,14 @@ refill_free_cache(FREE_PAGE_CACHE* cache, int shard) {
     while (cache->count < FREE_CACHE_MAX && moved < FREE_REFILL_BATCH && !IsListEmpty(&sh->entry)) {
         PLIST_ENTRY e = RemoveHeadList(&sh->entry);
         InterlockedDecrement64(&sh->list_count);
-        cache->pages[cache->count++] = get_pfn_from_PListEntry(e);
+        pfn_metadata* pfn = get_pfn_from_PListEntry(e);
+        // Null the links HERE (cold, batched) so the hot-path magazine pop needs no per-frame
+        // lock. The frame is off the shard and exclusively ours (RemoveHeadList unlinked it),
+        // so a plain write is safe -- and it restores the NULL sentinel a later RWListInsertTail
+        // expects once the frame is faulted in and eventually trimmed.
+        pfn->links.Flink = NULL;
+        pfn->links.Blink = NULL;
+        cache->pages[cache->count++] = pfn;
         moved++;
     }
     LeaveCriticalSection(&sh->list_lock);
@@ -710,6 +717,11 @@ print_statistics(VOID)
     printf("  MODIFIED: %6llu  (%.1f%%)\n", mod_c,  100.0 * mod_c / total);
     printf("  STANDBY:  %6llu  (%.1f%%)\n", stby_c, 100.0 * stby_c / total);
     printf("  ZERO:     %6llu  (%.1f%%)\n", zero_c, 100.0 * zero_c / total);
+    // Whatever isn't on a list is momentarily in-transit inside a thread-local trim/disc/zero
+    // batch. Sampled racily, so clamp at 0. FREE+ACTIVE+MODIFIED+STANDBY+ZERO+IN-TRANSIT == total.
+    LONG64 intransit = (LONG64)total - (LONG64)(free_c + act_c + mod_c + stby_c + zero_c);
+    if (intransit < 0) intransit = 0;
+    printf("  IN-TRANSIT:%6lld  (%.1f%%)\n", intransit, 100.0 * (double)intransit / total);
     if (faults > 0) {
         printf("  HARD:     %6llu  (%.1f%%)\n", hard, 100.0 * hard / faults);
         printf("  SOFT:     %6llu  (%.1f%%)\n", soft, 100.0 * soft / faults);
@@ -1581,7 +1593,7 @@ periodic_thread(PVOID parameter)
         check_concurrent_list(&modifiedList_head, LIST_MODIFIED, "modified");
 #endif
 
-#if DEBUG
+#if STATISTICS
         printf("\n[%6llums] act=%6lld mod=%6lld stby=%6lld free=%5lld zero=%5lld disc=%6lld "
             "| consume=%7.0f trim=%7.0f write=%7.0f soft=%7.0f | remaining=%.2fs\n",
             now - t_start,
@@ -1631,6 +1643,11 @@ zero_thread(PVOID parameter)
 
         for (;;) {
             if (WaitForSingleObject(shutdown_event, 0) == WAIT_OBJECT_0) break;
+            // Stop once the reserve is full. The surplus then stays on STANDBY as the soft-fault
+            // cache instead of being drained into zeroed frames that disc-backed faults (the
+            // common case) would just overwrite. zero_pfns also taps standby, so capping the
+            // loop here is what stops standby from being drained to zero.
+            if ((ULONG64)zeroList_head.list_count >= ZEROED_LIST_HIGH) break;
             if (zero_pfns(batch_base) == 0) break;
         }
     }
