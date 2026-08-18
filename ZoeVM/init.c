@@ -1,8 +1,8 @@
-// init.c : One-time initialization and program setup for ZoeVM.
+// init.c : One-time initialization and program setup
 //
 // Holds allocation of the PFN metadata table, PTE regions, disc/pagefile,
 // events, the master init() entry point, and setup_program() (privilege
-// acquisition + physical page / virtual address space allocation).
+// acquisition + physical page / virtual address space allocation)
 
 #include "vm.h"
 #include "init.h"
@@ -33,15 +33,14 @@ init_lists(
     InitializeList(&zeroList_head);
 }
 
-// Commit only the page(s) of the reserved PFN table that hold this frame's slot.
-// Idempotent: MEM_COMMIT on already-committed memory succeeds and is cheap.
+// Commit only the page(s) of the reserved PFN table that hold this frame's slot
 static VOID
 ensure_metadata_slot_is_committed(
     ULONG64 frame
 ) {
     PVOID slot_addr = (PVOID)&physical_slots[frame];
 
-    // A slot can straddle a page boundary, so commit the whole span it covers.
+    // A slot can straddle a page boundary, so commit the whole span it covers
     PVOID start = (PVOID)((ULONG_PTR)slot_addr & ~((ULONG_PTR)PAGE_SIZE - 1));
     PVOID last = (PVOID)(((ULONG_PTR)slot_addr + sizeof(pfn_metadata) - 1)
         & ~((ULONG_PTR)PAGE_SIZE - 1));
@@ -122,47 +121,33 @@ init_disc_allocator(VOID)
     disc_page_count = NUM_DISC_PAGES;
     disc = create_page_file(&disc_page_count);
 
-    disc_regions = malloc(DISC_REGIONS * sizeof(DISC_REGION));
-    if (disc_regions == NULL) { DebugBreak(); return; }
+    // Lock-free slot bitmap: one bit per slot (0 = free) and 64 bits to a row
+    disc_bitmap_rows = (disc_page_count + 63) / 64;
+    disc_bitmap = calloc(disc_bitmap_rows, sizeof(LONG64));
+    if (disc_bitmap == NULL) { DebugBreak(); return; }
 
-    ULONG64 assigned = 0;
-    for (ULONG64 r = 0; r < DISC_REGIONS; r++) {
-        PDISC_REGION reg = &disc_regions[r];
-        InitializeCriticalSectionAndSpinCount(&reg->lock, 0x00FFFFFF);
-        reg->base_slot = assigned;
-        // Last region absorbs the remainder so no slots are lost.
-        reg->slot_count = (r == DISC_REGIONS - 1)
-            ? (disc_page_count - assigned)
-            : DISC_SLOTS_PER_REGION;
-        reg->free_count = reg->slot_count;
-        reg->cursor = 0;
-        reg->bytemap = calloc(reg->slot_count, sizeof(BYTE)); // all free
-        if (reg->bytemap == NULL) { DebugBreak(); return; }
-        assigned += reg->slot_count;
+    // Mark any tail bits beyond disc_page_count as USED so never handed out
+    ULONG64 tail = disc_bitmap_rows * 64 - disc_page_count;
+    if (tail > 0) {
+        ULONG64 last = disc_bitmap_rows - 1;
+        for (ULONG64 b = 64 - tail; b < 64; b++) {
+            disc_bitmap[last] |= (1LL << b);
+        }
     }
-    ASSERT(assigned == disc_page_count);
-}
-
-// Initialize global locks
-VOID
-init_global_locks(
-    VOID
-) {
-    // None anymore
+    g_disc_free_count = (LONG64)disc_page_count;
 }
 
 // Initialize pte locks
 VOID
-init_pte_regions(
-    VOID
-) {
+init_pte_regions(VOID) 
+{
     pte_regions = malloc(NUM_PTE_LOCKS * sizeof(PTE_REGION));
     if (pte_regions == NULL) {
         DebugBreak();
         return;
     }
-    // Region-age index: AGES lists of regions, all empty; regions start on none of them
-    // (REGION_AGE_NONE) because they have no active pages yet.
+
+    // Begin with empty age lists of regions
     InitializeCriticalSectionAndSpinCount(&region_age_lock, 0x00FFFFFF);
     for (int age = 0; age < AGES; age++) {
         InitializeListHead(&region_age_lists[age].head);
@@ -176,15 +161,14 @@ init_pte_regions(
             InitializeListHead(&pte_regions[i].active_age_lists[age]);
             pte_regions[i].age_counts[age] = 0;
         }
-        pte_regions[i].age_list_number = REGION_AGE_NONE;   // no active pages -> on no region-age list
+        pte_regions[i].age_list_number = REGION_AGE_NONE;   // no active pages so on no region-age list
     }
 }
 
 // Initialize events
 VOID
-init_events(
-    VOID
-) {
+init_events(VOID) 
+{
     // Auto-reset events
     startAge_event = CreateEvent(NULL, FALSE, FALSE, NULL);
     startTrim_event = CreateEvent(NULL, FALSE, FALSE, NULL);
@@ -193,14 +177,13 @@ init_events(
     modifiedReady_event = CreateEvent(NULL, FALSE, FALSE, NULL);
     // Manual-reset events
     redoFault_event = CreateEvent(NULL, TRUE, FALSE, NULL);
-    shutdown_event = CreateEvent(NULL, TRUE, FALSE, NULL); // ZS implement event to shutdown all threads
+    shutdown_event = CreateEvent(NULL, TRUE, FALSE, NULL); 
 }
 
 // Initialize per-thread free-page caches
 VOID
-init_free_caches(
-    VOID
-) {
+init_free_caches(VOID)
+{
     for (int i = 0; i < NUM_THREADS; i++) {
         free_caches[i].count = 0;
         for (int j = 0; j < FREE_CACHE_MAX; j++) {
@@ -211,10 +194,8 @@ init_free_caches(
 }
 
 VOID
-init(
-    ULONG_PTR physical_page_count,
-    PULONG_PTR physical_page_numbers
-) {
+init(ULONG_PTR physical_page_count, PULONG_PTR physical_page_numbers)
+{
     init_lists();
     init_pfn_metadata(physical_page_count, physical_page_numbers);
     init_disc_allocator();
@@ -223,9 +204,7 @@ init(
 }
 
 BOOL
-GetPrivilege (
-    VOID
-)
+GetPrivilege(VOID)
 {
     struct {
         DWORD Count;
@@ -376,7 +355,6 @@ setup_program(
     physical_page_handle = GetCurrentProcess();
 
 #endif
-    init_global_locks();
 
     ULONG_PTR physical_page_count = NUMBER_OF_PHYSICAL_PAGES;
     physical_page_numbers = malloc(physical_page_count * sizeof(ULONG_PTR));

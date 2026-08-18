@@ -1,75 +1,60 @@
 #include "vm.h"
 #include "list.h"
 
-// ===========================================================================
-// RWList: reader/writer access to a CONCURRENT_LIST_HEAD (Option 1: exclusive writers).
-//
-//   * The list's SRW gives parallelism: SHARED = read-only walkers, EXCLUSIVE = ANY structural
-//     mutation (insert / remove / scan+remove). A mutation under EXCLUSIVE is the SOLE list
-//     mutator, so every splice is a plain doubly-linked-list operation -- no per-node
-//     lock-coupling, no neighbor locks, no escalation. That makes torn nodes / stale tails /
-//     orphaned segments structurally impossible.
-//   * Scans still take each visited node's pfn lock via TryEnter (skip-on-contention) so
-//     callers get the frame locked to read/mutate its state. TryEnter (never block) is
-//     required for deadlock-freedom: an inserter/remover holds a pfn lock and then wants our
-//     EXCLUSIVE srw, so blocking on that pfn lock would deadlock. Skipping is safe -- the ring
-//     is stable under EXCLUSIVE and the blocked remover completes the instant we end the scan.
-//   * list_type (under the pfn lock) stays the authoritative "which list" answer.
-//
-// The RW_LIST_CURSOR uses only `cur` (current node, or the anchor) and `cur_lock` (the pfn
-// lock we currently hold, or NULL); the prev/prev_lock fields are unused in this model.
-// ===========================================================================
+/*
+    RWList: reader/writer access to a CONCURRENT_LIST_HEAD
+    SRW lets there be parallelism
+    Shared - 1+ read-only walkers
+    Scans take visited node's pfn lock (TryEnter) so callers get frame locked to read or mutate its state
+*/
 
-// Insert node at the tail. Caller holds node->lock; node->links must be the NULL sentinel.
+// Insert node at tail
+// Caller holds node's lock so node->links must be null sentinel
 VOID
 RWListInsertTail(PCONCURRENT_LIST_HEAD L, pfn_metadata* node)
 {
     AcquireSRWLockExclusive(&L->srw);
-    InsertTailList(&L->entry, &node->links);   // sole mutator: plain splice
+    InsertTailList(&L->entry, &node->links);   // sole mutator
     InterlockedIncrement64(&L->list_count);
     ReleaseSRWLockExclusive(&L->srw);
 }
 
-// Remove a node the caller already owns (holds node->lock). No-op if already off the list.
+// Remove a node unless it is already off
+// Caller holds node's lock 
 VOID
 RWListRemoveKnown(PCONCURRENT_LIST_HEAD L, pfn_metadata* node)
 {
-    // WRONG-LIST GUARD: splicing `node` out of L uses node's own links, valid only if node is
-    // physically ON L. The caller picks L from node->list_type (under node->lock), so with
-    // coherent state list_type always names L. If not, refuse rather than corrupt L.
-    {
-        ULONG64 expect = (L == &standbyList_head) ? LIST_STANDBY : LIST_MODIFIED;
-        if (node->list_type != expect) {
+    // Node's list type in metadata should match the list it is being removed from
+    ULONG64 expect = (L == &standbyList_head) ? LIST_STANDBY : LIST_MODIFIED;
+    if (node->list_type != expect) {
 #if DEBUG
-            printf("WRONG-LIST REMOVE: node=%p frame=%llu list_type=%llu removing-from=%s\n",
-                node, node->frame_number, (ULONG64)node->list_type,
-                (L == &standbyList_head) ? "standby" : "modified");
-            DebugBreak();
+        printf("WRONG-LIST REMOVE: node=%p frame=%llu list_type=%llu removing-from=%s\n",
+            node, node->frame_number, (ULONG64)node->list_type,
+            (L == &standbyList_head) ? "standby" : "modified");
+        DebugBreak();
 #endif
-            return;
-        }
+        return;
     }
 
     AcquireSRWLockExclusive(&L->srw);
-    if (node->links.Flink != NULL) {   // on the list (both links set); sentinel is both NULL
+    if (node->links.Flink != NULL) {   // on list with both links set OR both NULL
         RemoveEntryList(&node->links);
         node->links.Flink = NULL;
         node->links.Blink = NULL;
         InterlockedDecrement64(&L->list_count);
     }
     ReleaseSRWLockExclusive(&L->srw);
+    return;
 }
 
-// Advance to the next lockable real node, skipping contended ones. Under EXCLUSIVE the ring is
-// stable, so no neighbor locks are needed -- just TryEnter the single current node's pfn lock.
-// Returns the node (with its lock held, transferred to the caller's care) or NULL at end.
+// Advance to next lockable node and TryEnter the single current node's pfn lock.
+// Returns the node with lock held or NULL
 static pfn_metadata*
 rwlist_scan_advance(RW_LIST_CURSOR* c)
 {
     PCONCURRENT_LIST_HEAD L = c->list;
 
-    // Release the node returned by the previous advance (unless a scan-remove already cleared
-    // cur_lock by transferring the lock to the caller).
+    // Release node returned by previous advance unless already cleared
     if (c->cur_lock != NULL) {
         LeaveCriticalSection(c->cur_lock);
         c->cur_lock = NULL;
@@ -79,17 +64,19 @@ rwlist_scan_advance(RW_LIST_CURSOR* c)
     for (;;) {
         PLIST_ENTRY next = c->forward ? e->Flink : e->Blink;
         if (next == &L->entry) {
-            c->cur = &L->entry;   // wrapped to the anchor: end of list
+            c->cur = &L->entry;   // wrapped to anchor signaling end of list
             return NULL;
         }
 #if DEBUG
-        if ((BYTE*)next < (BYTE*)physical_slots ||
-            (BYTE*)next >(BYTE*)&physical_slots[max_frame_number]) {
-            printf("SCAN WILD NODE (%s): from %p -> next %p\n",
-                (L == &standbyList_head) ? "standby" : "modified", e, next);
-            DebugBreak();
-            c->cur = &L->entry;
-            return NULL;
+        {
+            if ((BYTE*)next < (BYTE*)physical_slots ||
+                (BYTE*)next >(BYTE*) & physical_slots[max_frame_number]) {
+                printf("SCAN WILD NODE (%s): from %p -> next %p\n",
+                    (L == &standbyList_head) ? "standby" : "modified", e, next);
+                DebugBreak();
+                c->cur = &L->entry;
+                return NULL;
+            }
         }
 #endif
         CRITICAL_SECTION* nl = &get_pfn_from_PListEntry(next)->lock;
@@ -109,13 +96,14 @@ rwlist_scan_advance(RW_LIST_CURSOR* c)
 #endif
             return get_pfn_from_PListEntry(next);
         }
-        // Contended: the holder is a remover/inserter blocked on our exclusive srw. Skip past
-        // this node (ring is stable under EXCLUSIVE) and keep looking; it is picked up next pass.
+        // Contended since holder is a remover/inserter blocked on exclusive srw
+        // Skip past node (stable under exclusive) and keep looking
         e = next;
     }
 }
 
-// Begin a scan under EXCLUSIVE srw; return the first lockable real node (NULL if empty).
+// Begin a scan under exclusive srw
+// Return the first lockable real node or NULL if empty
 pfn_metadata*
 RWListScanBegin(PCONCURRENT_LIST_HEAD L, RW_LIST_CURSOR* c, BOOLEAN forward)
 {
@@ -124,20 +112,20 @@ RWListScanBegin(PCONCURRENT_LIST_HEAD L, RW_LIST_CURSOR* c, BOOLEAN forward)
     c->forward = forward;
     c->cur = &L->entry;
     c->cur_lock = NULL;
-    c->prev = NULL;         // unused in the exclusive model
+    c->prev = NULL;         // unused in exclusive model
     c->prev_lock = NULL;
     return rwlist_scan_advance(c);
 }
 
-// Advance to and return the next node (with its lock held), or NULL at end of list.
+// Advance to and return next node (with lock held) or NULL at end of list
 pfn_metadata*
 RWListScanNext(RW_LIST_CURSOR* c)
 {
     return rwlist_scan_advance(c);
 }
 
-// Remove the current node and TRANSFER its lock to the caller. Under EXCLUSIVE this always
-// succeeds (sole mutator). The cursor resumes from cur's predecessor.
+// Remove current node and transfer its lock to the caller
+// Cursor resumes from cur's predecessor
 pfn_metadata*
 RWListScanRemoveCurrent(RW_LIST_CURSOR* c)
 {
@@ -154,13 +142,14 @@ RWListScanRemoveCurrent(RW_LIST_CURSOR* c)
 
     pfn_metadata* removed = get_pfn_from_PListEntry(cur);
 
-    // Transfer cur's lock to the caller; cursor resumes from the (unlocked) predecessor.
+    // Transfer cur's lock to the caller and cursor resumes from the (unlocked) predecessor
     c->cur = resume;
     c->cur_lock = NULL;
     return removed;
 }
 
-// End a scan: release the current node's lock (if still held) and the EXCLUSIVE srw.
+// End a scan 
+// Release the current node's lock and exclusive srw
 VOID
 RWListScanEnd(RW_LIST_CURSOR* c)
 {
@@ -171,9 +160,9 @@ RWListScanEnd(RW_LIST_CURSOR* c)
     ReleaseSRWLockExclusive(&c->list->srw);
 }
 
-// Rescue the current standby node (repoint its owner PTE to disc) then remove it, transferring
-// its lock to the caller. Returns NULL (leaving the node on standby, cursor intact) if the
-// owner region is contended. Under EXCLUSIVE the unlink itself always succeeds.
+// Rescue current standby node by repointing its owner transition PTE to disc
+// Remove it and transfer its lock to the caller
+// Returns NULL if owner region is contended
 pfn_metadata*
 rwlist_scan_rescue_remove(RW_LIST_CURSOR* c)
 {
@@ -184,7 +173,7 @@ rwlist_scan_rescue_remove(RW_LIST_CURSOR* c)
     pfn_metadata* pfn = get_pfn_from_PListEntry(cur);
 
     if (!rescue_standby_to_disc(pfn)) {
-        return NULL;   // owner region contended: leave the node on standby (cursor intact)
+        return NULL;   // owner region contended sp leave node on standby
     }
 
     PLIST_ENTRY resume = c->forward ? cur->Blink : cur->Flink;
@@ -193,20 +182,17 @@ rwlist_scan_rescue_remove(RW_LIST_CURSOR* c)
     cur->Blink = NULL;
     InterlockedDecrement64(&L->list_count);
 
-    claim_rescued_pfn(pfn);   // list_type = NONE (stamp owner)
+    claim_rescued_pfn(pfn);   // set list_type to NONE
 
     c->cur = resume;
-    c->cur_lock = NULL;   // transfer cur's lock to the caller
+    c->cur_lock = NULL;   // transfer cur's lock to caller
     ASSERT(pfn->links.Flink == NULL && pfn->links.Blink == NULL);
     return pfn;
 }
 
-// Debug integrity checker: walk a concurrent list under EXCLUSIVE srw (a clean, mutation-free
-// snapshot) and DebugBreak on the FIRST inconsistency -- so corruption is caught within ~1s of
-// being introduced, with the list still intact, instead of minutes later as a wild pointer.
-// Checks: every node is a real frame (inside physical_slots), doubly-linked consistency
-// (node->Blink == prev), list_type matches the list (never ACTIVE), no runaway/cycle, and the
-// walked count matches list_count. Call from periodic_thread.
+// Walk concurrent list under exclusive srw and DebugBreak on the first inconsistency
+// Checks that every node is a real frame inside physical_slots, doubly-linked consistency, 
+// list_type matches the list, no runaway/cycle, walked count matches list_count
 VOID
 check_concurrent_list(PCONCURRENT_LIST_HEAD L, ULONG64 expected_type, const char* name)
 {
@@ -218,9 +204,7 @@ check_concurrent_list(PCONCURRENT_LIST_HEAD L, ULONG64 expected_type, const char
     ULONG64 cap = (ULONG64)max_frame_number + 8;   // runaway/cycle guard
 
     while (e != &L->entry) {
-        // Wild-pointer guard FIRST -- a real node's links live inside physical_slots
-        // (links is at offset 0, so the entry pointer IS the pfn pointer). Catch a bad
-        // Flink here, before we dereference it.
+        // Wild-pointer guard: real node's links live inside physical_slots
         if ((BYTE*)e < (BYTE*)physical_slots ||
             (BYTE*)e >(BYTE*)&physical_slots[max_frame_number]) {
             printf("LIST CORRUPT (%s): wild node %p after prev %p at count %llu\n",
@@ -253,12 +237,9 @@ check_concurrent_list(PCONCURRENT_LIST_HEAD L, ULONG64 expected_type, const char
     }
 
     ULONG64 lc = (ULONG64)InterlockedOr64((volatile LONG64*)&L->list_count, 0);
-    if (count == lc || count > cap) { /* count mismatch only meaningful on a clean full walk */ }
+    if (count == lc || count > cap) { /* count mismatch is only meaningful on a clean full walk */ }
     else {
-        // Count drift is the MILD signal (an unpaired increment/decrement) -- the structure
-        // above is intact. Don't break on it: log, auto-correct list_count to the physical
-        // truth, and keep running so the FATAL structural checks (wild node / Blink break /
-        // active-in-list) can catch the dangerous corruption with a clean dump.
+        // Auto-correct list_count to true count and keep running
         printf("LIST DRIFT (%s): walked %llu but list_count=%llu -- correcting, continuing\n",
             name, count, lc);
         InterlockedExchange64((volatile LONG64*)&L->list_count, (LONG64)count);

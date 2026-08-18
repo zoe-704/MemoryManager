@@ -43,15 +43,14 @@ VOID
 set_pte_valid(PPTE pte, ULONG64 frame_number, ULONG64 age)
 {
     PTE snapshot;
-    // ZS use in other places read not necessary here
     // snapshot.entire_contents = ReadULong64NoFence(&pte->entire_contents);
     snapshot.entire_contents = 0;
 
     snapshot.hardware.valid = 1;
     snapshot.hardware.accessed = 1; // freshly faulted-in page counts as accessed but set 0 to start as cold
-    snapshot.hardware.age = 0; // ZS only age?
     snapshot.hardware.frame_number = frame_number;
     snapshot.hardware.reserved = 0;
+    (void)age;   // age is now the region age-bucket, not a PTE field; param kept for callers' ABI
 
     WriteULong64NoFence(&pte->entire_contents, snapshot.entire_contents);
 }
@@ -94,6 +93,7 @@ set_pte_disc(PPTE pte, ULONG64 disc_index)
 
 // Repurpose a standby frame by pointing its PTE at the disc copy and clearing the frame's pte/disc
 // Caller holds the frame's lock
+// Disc pte has a region lock and the transition pte could have a different region lock
 BOOLEAN
 rescue_standby_to_disc(pfn_metadata* pfn)
 {
@@ -113,7 +113,7 @@ rescue_standby_to_disc(pfn_metadata* pfn)
     return TRUE;
 }
 
-// Age stuff
+// For the non-page faulting path
 VOID
 pte_set_accessed(PPTE pte)
 {
