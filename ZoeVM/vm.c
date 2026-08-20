@@ -482,7 +482,6 @@ create_page_file(PULONG64 number_of_pages)
 // One bit per slot (1 = used) and 64 in a LONG64 "row"
 // Disc bitmap frees are atomic bit-clears
 // Allocation by disc thread reserving slots into thread-local stash or claiming free bits 1 at atime
-
 #define DISC_STASH_MAX (DISC_WRITE_BATCH * 2)
 static __declspec(thread) ULONG64 disc_stash[DISC_STASH_MAX];
 static __declspec(thread) int     disc_stash_count = 0;
@@ -731,8 +730,9 @@ print_statistics(VOID)
     printf("  MODIFIED: %6llu  (%.1f%%)\n", mod_c,  100.0 * mod_c / total);
     printf("  STANDBY:  %6llu  (%.1f%%)\n", stby_c, 100.0 * stby_c / total);
     printf("  ZERO:     %6llu  (%.1f%%)\n", zero_c, 100.0 * zero_c / total);
-    // Whatever isn't on a list is momentarily in-transit inside a thread-local trim/disc/zero
-    // batch. Sampled racily, so clamp at 0. FREE+ACTIVE+MODIFIED+STANDBY+ZERO+IN-TRANSIT == total.
+
+    // Sampled racily so clamp at 0 
+    // FREE+ACTIVE+MODIFIED+STANDBY+ZERO+IN-TRANSIT
     LONG64 intransit = (LONG64)total - (LONG64)(free_c + act_c + mod_c + stby_c + zero_c);
     if (intransit < 0) intransit = 0;
     printf("  IN-TRANSIT:%6lld  (%.1f%%)\n", intransit, 100.0 * (double)intransit / total);
@@ -742,7 +742,7 @@ print_statistics(VOID)
     }
     printf("--------------------------------\n");
 
-    // Per-thread breakdown (each thread owns its slot, so these are exact, not sampled).
+    // Per-thread exact breakdown
     printf("  thread |     hard |     soft | hard_disc | hard_zero |    waits |    trims |   writes |   zeroes\n");
     for (int t = 0; t < NUM_THREADS; t++) {
         THREAD_STATS* s = &thread_stats[t];
@@ -815,11 +815,11 @@ write_modified_list(VOID)
         if (pfn->list_type == LIST_MODIFIED && !pfn->being_written) {
             ULONG64 slot = get_disk_free_slots();
             if (slot == (ULONG64)-1) {
-                // disc full: leave this frame on modified and stop collecting
+                // Disc full: leave this frame on modified and stop collecting
                 SetEvent(redoFault_event);
                 break;
             }
-            // Scan holds cur_lock/pfn->lock
+            // Scan holds curr_lock (== this pfn->lock)
             pfn->being_written = 1;
             pfn_metadata* removed = RWListScanRemoveCurrent(&cur);
             if (removed == NULL) {
@@ -1065,37 +1065,28 @@ zero_pfns(PULONG_PTR batch_base)
     return count;
 }
 
-// Resolve a fault at arbitrary_va by dispatching to the soft/hard handlers. The caller retries
-// the SAME va afterward (there is no "advance" case out of a fault), so this reports nothing back:
-// on every path the fault is either resolved here or left for the next retry. run_len drives the
-// hard-fault run prefetch (pages remaining in the current run); pass 0 to disable it (e.g. the
-// random workload, which has no runs).
+// Resolve a fault at VA and retry same VA after
+// run_len does hard-fault run prefetch (pages remaining in the current run)
 VOID handle_page_fault(PVOID arbitrary_va, PPTE pte, ULONG64 run_len) {
-    // Snapshot the PTE once; a concurrent writer can change it between reads.
     PTE snap;
     *(ULONG64*)&snap = *(volatile ULONG64*)pte;
-
-    // pte/region/page-aligned VA are fixed by the faulting VA -- derive once and thread
-    // them into the handlers (and the hard->soft hand-off) instead of recomputing.
     PPTE_REGION region_struct = get_pte_region(pte);
     PVOID page_aligned = (PVOID)((ULONG_PTR)arbitrary_va & ~(PAGE_SIZE - 1));
 
-    // Check 1: another thread may have already resolved this fault -- retry finds it valid.
+    // Check 1: another thread may have already resolved this fault
     if (snap.hardware.valid == 1) {
         return;
     }
 
-    // Check 2: transition PTE -- soft fault (rescue from modified/standby).
+    // Check 2: transition PTE soft fault (rescue from modified/standby)
     else if (snap.transition.valid == 0 && snap.transition.transition == 1) {
         handle_soft_fault(arbitrary_va, pte, region_struct, page_aligned);
     }
 
-    // Check 3: brand-new or disc-backed PTE -- hard fault.
+    // Check 3: new/disc PTE
     else if (snap.hardware.valid == 0 && snap.transition.transition == 0) {
 #if FAULT_RUN_PREFETCH
-        // Prefetch the rest of this contiguous run in one batch when the workload has a run.
-        // Subsequent touches then resolve as ordinary non-faulting accesses. NOTE: regresses on
-        // the single-disc-writer config -- see FAULT_RUN_PREFETCH in vm.h.
+        // Prefetch the rest of this contiguous run in one batch 
         if (run_len > 0) {
             handle_hard_fault_run(arbitrary_va, pte, region_struct, page_aligned, run_len);
             return;
@@ -1104,7 +1095,7 @@ VOID handle_page_fault(PVOID arbitrary_va, PPTE pte, ULONG64 run_len) {
         handle_hard_fault(arbitrary_va, pte, region_struct, page_aligned);
     }
 
-    // Check 4: unexpected change to pte, try same va again.
+    // Check 4: unexpected change to PTE so try same VA again
     else {
         return;
     }
@@ -1259,8 +1250,7 @@ page_fault_thread_nonrandom (PVOID parameter)
                 ULONG64 r = GetNextRandom(&thread_rng);
 
                 if (hot_count > 0 && (r % REVISIT_CHANCE) == 0) {
-                    // REVISIT: re-touch the same base AND length as before, so those
-                    // pages are still valid or on modified/standby (soft faults)
+                    // REVISIT: re-touch the same base and length as before, so those pages are still valid or on modified/standby (soft faults)
                     int pick;
                     if ((GetNextRandom(&thread_rng) % RECENT_BIAS) == 0) {
                         int recent = (hot_count < 4) ? hot_count : 4;
@@ -1381,12 +1371,7 @@ trim_thread(PVOID parameter)
     printf("Trim thread %i: starting virtual memory simulation workload...\n", thread_index);
     QueryPerformanceCounter(&start_time);
 
-    // Level controller: hold the ready pool (free+standby+zero) at POOL_HIGH_WATER by trimming
-    // only the *deficit* (proportional, so no overshoot), and STOP once the setpoint is reached
-    // so the working set stays resident. This replaces the old rate-based bang-bang throttle
-    // (full-throttle vs off) that oscillated on the 1s period and thrashed the working set
-    // (evict ~100K -> soft-fault right back). Reaction is fast (a short poll + startTrim_event,
-    // which faults raise the instant they can't get a page), not gated by the periodic thread.
+    // Level controller to hold the ready pool (free+standby+zero) at POOL_HIGH_WATER by trimming proportionally to deficit
     for (;;) {
         if (WaitForSingleObject(shutdown_event, 0) == WAIT_OBJECT_0) break;
 
@@ -1454,7 +1439,7 @@ disc_thread(PVOID parameter)
         if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) break;
         if (WaitForSingleObject(shutdown_event, 0) == WAIT_OBJECT_0) break;
 
-        // Drain the modified list by progress, each frame returns how many franes it committed
+        // Drain the modified list by progress and each frame returns how many franes it committed
         for (;;) {
             if (WaitForSingleObject(shutdown_event, 0) == WAIT_OBJECT_0) break;
             if (write_modified_list() == 0) break;

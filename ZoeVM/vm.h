@@ -22,7 +22,7 @@
 
 // Use physical page pool ~1% of VA space
 #define NUMBER_OF_PHYSICAL_PAGES    (1 * GB(1) / PAGE_SIZE)
-#define NUM_DISC_PAGES              (3 * NUMBER_OF_PHYSICAL_PAGES)
+#define NUM_DISC_PAGES              (1 * NUMBER_OF_PHYSICAL_PAGES)
 #define MAX_DISC_PTE_BITS           40
 #define MAX_DISC_SIZE               ((ULONG64) 1 << MAX_DISC_PTE_BITS)
 #define INVALID_DISC_SLOT           ((1ULL << MAX_DISC_PTE_BITS) - 1)
@@ -42,6 +42,7 @@
 #define LOW_FREE_PAGE_THRESHOLD     (NUMBER_OF_PHYSICAL_PAGES / 64)
 #define POOL_HIGH_WATER             (NUMBER_OF_PHYSICAL_PAGES / 16)    // stop trimming once ready pool is this level (lower = more active pages)
 #define PTES_PER_LOCK               512
+#define LIST_COUPLE_MAX_FAILS       4                                  // RWList: retries before escalating to the exclusive lock
 
 // Disc thresholds
 #define DISC_WRITE_BATCH        64
@@ -71,7 +72,7 @@
 
 // Ages and consumption rate thresholds
 #define AGES                    8
-#define REGION_AGE_NONE         AGES   // region has no active pages so not on region-age list
+#define REGION_AGE_NONE         AGES // region has no active pages so not on region-age list
 #define AGE_TICK_MS             25   // fixed cadence of the age thread
 #define AGE_ALPHA               1.0  // >1 ages faster
 #define AGE_TSWEEP_MIN_MS       25   // cap under heavy pressure
@@ -107,20 +108,25 @@ typedef struct _LIST_HEAD_ENTRY {
 } LIST_HEAD, * PLIST_HEAD;
 
 // Struct for fine-grained concurrent lists
+// srw: shared = many inserts/removes/scans through the list in parallel 
+//      exclusive = fallbackk so conteded node completes
+// head_lock: guards the head sentinel, which is not a PFN and has no lock of its own
 typedef struct _CONCURRENT_LIST_HEAD {
     LIST_ENTRY entry;
-    SRWLOCK srw;                  // shared = parallel removers, exclusive = inserter
-    CRITICAL_SECTION head_lock;  
-    ULONG64 list_count;      
+    SRWLOCK srw;
+    CRITICAL_SECTION head_lock;
+    ULONG64 list_count;
 } CONCURRENT_LIST_HEAD, * PCONCURRENT_LIST_HEAD;
 
-// Walk cursor for scanning a CONCURRENT_LIST_HEAD under shared acces and skip contended nodes
+// Walk cursor for scanning a CONCURRENT_LIST_HEAD under shared access with lock-coupling
+// Holds two node locks at a time: pred (node before curr) and curr (returned by ScanNext)
+// Advancing releases the old pred and promotes curr
 typedef struct _RW_LIST_CURSOR {
     PCONCURRENT_LIST_HEAD list;
-    PLIST_ENTRY       prev;
-    CRITICAL_SECTION* prev_lock;
-    PLIST_ENTRY       cur;
-    CRITICAL_SECTION* cur_lock;
+    PLIST_ENTRY       pred;
+    CRITICAL_SECTION* pred_lock;
+    PLIST_ENTRY       curr;
+    CRITICAL_SECTION* curr_lock;
     BOOLEAN           forward;
 } RW_LIST_CURSOR;
 
@@ -160,11 +166,11 @@ typedef struct {
 typedef struct _PTE_REGION {
     CRITICAL_SECTION lock;
     ULONG64 active_page_count;
-    LIST_ENTRY active_age_lists[AGES];  // this region's ACTIVE frames, bucketed by age
+    LIST_ENTRY active_age_lists[AGES];  // this region's active frames bucketed by age
     ULONG64 age_counts[AGES];           // length of each bucket (O(1) region age)
-    // --- region-age-list membership; guarded by region_age_lock, NOT region->lock ---
-    LIST_ENTRY age_link;                // this region's node on region_age_lists[age_list_number]
-    ULONG64    age_list_number;         // which region-age list, or REGION_AGE_NONE
+    //region-age-list membership (region_age_lock, NOT region->lock)
+    LIST_ENTRY age_link;                // this region's node on age lists
+    ULONG64    age_list_number;         // which region-age list/REGION_AGE_NONE
 } PTE_REGION, * PPTE_REGION;
 
 // One list of REGIONS per age level (regions here all share the same oldest-page age).
