@@ -1,5 +1,5 @@
-﻿# CMakeList.txt : Top-level CMake project file, do global configuration
-# and include sub-projects here.
+# CMakeList.txt : Top-level CMake project file, do global configuration
+# and define the ZoeVM executable here.
 #
 cmake_minimum_required (VERSION 3.10)
 
@@ -11,5 +11,9 @@ endif()
 
 project ("ZoeVM")
 
-# Include sub-projects.
-add_subdirectory ("ZoeVM")
+# Add source to this project's executable.
+add_executable (ZoeVM
+  "vm.c" "init.c" "globals.c" "pte.c" "fault.c" "pfn.c" "list.c" "stats.c" "disc.c"
+  "vm.h" "init.h" "globals.h" "pte.h" "fault.h" "pfn.h" "list.h" "stats.h" "disc.h")
+
+# TODO: Add tests and install targets if needed.
