@@ -111,20 +111,8 @@ Runtime holds flat (~7900–8700 ms), with the fastest runs near **7 fault threa
 **Rationale.** The hot fault path is nearly contention-free: each thread pulls frames from its own thread-local cache and free shard and bumps its own stats slot, so fault threads rarely touch each other. The shared modified/standby lists are entered shared, with threads taking PFN locks with bounded retries before escalation to exclusive. `MapUserPhysicalPagesScatter`, which is the bulk of hard-fault time, runs outside any global lock. Region-lock contention on the active lists is negligible. Contention comes from disc-backed frames being supplied by a single-threaded trimmer. The per-fault access-violation sets the pace of the fault threads to that supply rate (at balance, fault-waits ≈ 0). Once enough fault threads saturate the producer and total threads approach the 12-core budget, extra fault threads have nothing more to consume, so runtime stays flat rather than dropping.
 
 
-## Lock hierarchy
-Region lock (PTE / active age lists)
+## Lock hierarchy: acquire top to bottom
 
-List locks (SRW shared + per-PFN)
-
-PFN lock (list type, status bits)
-
-Disc (lock-free bitmap)
-
-Standby repurpose: list known, so TryEnter region lock OR drop list and redo fault 
-
-Lock hierarchy
-
-Acquire top to bottom:
 Standby repurpose: list known before PTE, so TryEnter region lock, else drop list and redo fault
 
 Region lock (PTE/active age lists)
@@ -192,3 +180,6 @@ Key tunables live in `vm.h`:
 | `fault.c` / `fault.h` | Soft / hard / prefetch fault handlers.                                                                                              |
 | `disc.c` / `disc.h`   | Disc declarations (`disc.c` is an empty stub; the allocator lives in `init.c` + `vm.c`).                                            |
 | `stats.c` / `stats.h` | Statistics declarations (`stats.c` is an empty stub; the stat routines live in `vm.c`).                                             |
+
+
+Note: Bob Sun user commits was my work from a shared family VS account.
