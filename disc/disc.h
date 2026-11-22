@@ -16,3 +16,4 @@ extern volatile LONG64  g_disc_free_count;
 PVOID   create_page_file(PULONG64 number_of_pages);
 ULONG64 get_disk_free_slots(VOID);
 VOID    return_disk_free_slots(ULONG64 slot);
+ULONG64 disc_free_pages(VOID);

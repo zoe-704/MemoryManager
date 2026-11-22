@@ -1,3 +1,5 @@
+#include "vm.h"
+#include "disc.h"
 
 // Disc
 // Create fake disc
@@ -103,7 +105,7 @@ return_disk_free_slots(ULONG64 slot)
 }
 
 // Count of free disc slots excluding stashed ones
-static ULONG64
+ULONG64
 disc_free_pages(VOID)
 {
     LONG64 f = InterlockedOr64(&g_disc_free_count, 0);
