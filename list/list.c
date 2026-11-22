@@ -1,35 +1,7 @@
 #include "vm.h"
 #include "list.h"
 
-/*
-    RWList: shared reader/writer access to a CONCURRENT_LIST_HEAD.
-
-    The modified and standby lists are hit by many threads at once and cannot be sharded
-    (ordering carries meaning), so they use a hybrid: an SRWLOCK on the list plus a
-    CRITICAL_SECTION embedded in every PFN, plus a dedicated lock (head_lock) for the head
-    sentinel, which is not a PFN and so has no lock of its own.
-
-    Everyone enters shared and locks individual nodes hand-over-hand, so several threads can
-    insert at the tail, remove from the middle, and scan at once as long as they are not
-    touching adjacent nodes. Two policies sit on top of that:
-
-      "I want THIS exact node" (RWListInsertTail / RWListRemoveKnown): cannot skip a contended
-      neighbor, so it retries LIST_COUPLE_MAX_FAILS times then escalates to the exclusive lock,
-      which guarantees completion. Every critical section is released before escalating so the
-      escalation can never be the tail of a wait cycle.
-
-      "I want ANY eligible node" (RWListScanBegin/Next/RemoveCurrent/End): never escalates. A
-      contended node just ends the pass and is picked up on a later one. The cursor holds pred
-      and curr; a successful remove transfers ownership of the removed node's lock to the caller
-      (mirrors lock_pfn / unlock_pfn).
-
-    INVARIANT: a node's Flink/Blink may only be written while holding that node's lock. So an
-    insert holds the two straddling nodes' locks, and a remove holds the node's lock plus both
-    neighbors' locks. head_lock stands in for the sentinel's lock throughout.
-*/
-
-// Resolve the lock guarding a list entry: the head sentinel uses the list's head_lock,
-// every real node uses its own embedded pfn->lock.
+// Resolve the lock guarding a list entry (head sentinel uses list's head_lock, rest use its pfn->lock)
 static CRITICAL_SECTION*
 rwlist_node_lock(PCONCURRENT_LIST_HEAD L, PLIST_ENTRY entry)
 {
@@ -37,8 +9,8 @@ rwlist_node_lock(PCONCURRENT_LIST_HEAD L, PLIST_ENTRY entry)
     return &get_pfn_from_PListEntry(entry)->lock;
 }
 
-// Insert node at the tail under shared access.
-// PRECONDITION: caller holds node's lock and node is unlinked (links are NULL).
+// Insert node at the tail under shared access
+// PRECONDITION: caller holds node's lock and node is unlinked (links are NULL)
 VOID
 RWListInsertTail(PCONCURRENT_LIST_HEAD L, pfn_metadata* node)
 {
@@ -46,14 +18,13 @@ RWListInsertTail(PCONCURRENT_LIST_HEAD L, pfn_metadata* node)
     ULONG64 fails = 0;
 
     for (;;) {
-        // head_lock is the entry point for every tail insert.
+        // head_lock is the entry point for every tail insert
         if (!TryEnterCriticalSection(&L->head_lock)) {
             if (++fails < LIST_COUPLE_MAX_FAILS) continue;
             goto escalate;   // nothing held on this branch, safe to escalate straight away
         }
 
-        // On an empty list head.Blink IS the sentinel, so tail_lock collapses to head_lock;
-        // same_lock stops us double-acquiring the critical section we already hold.
+        // On an empty list head.Blink is head sentinel, tail_lock = head_lock and same_lock prevents double-acquiring
         PLIST_ENTRY tail = L->entry.Blink;
         CRITICAL_SECTION* tail_lock = rwlist_node_lock(L, tail);
         BOOLEAN same_lock = (tail_lock == &L->head_lock);
@@ -63,7 +34,7 @@ RWListInsertTail(PCONCURRENT_LIST_HEAD L, pfn_metadata* node)
             goto escalate;
         }
 
-        // Both neighbors of the new node locked: splice in at the tail.
+        // Both neighbors of the new node locked, splice in at the tail
         node->links.Flink = &L->entry;
         node->links.Blink = tail;
         tail->Flink = &node->links;
@@ -77,8 +48,7 @@ RWListInsertTail(PCONCURRENT_LIST_HEAD L, pfn_metadata* node)
     }
 
 escalate:
-    // Every critical section from the loop is released by now, so blocking on exclusive
-    // (which waits for all shared holders to leave) cannot close a wait cycle.
+    // Every lock from  loop is released by now, so blocking on exclusive can't close a wait cycle
     ReleaseSRWLockShared(&L->srw);
     AcquireSRWLockExclusive(&L->srw);
     InsertTailList(&L->entry, &node->links);   // exclusive already excludes everyone else
@@ -86,16 +56,14 @@ escalate:
     ReleaseSRWLockExclusive(&L->srw);
 }
 
-// Unlink a SPECIFIC node the caller already knows about (e.g. a soft fault poaching one
-// exact frame back off modified/standby).
-// PRECONDITION: caller holds node's lock for the whole call (including escalation), which
-// is what makes reading node->links.Flink/Blink safe without extra locking.
+// Unlink a specific node the caller already knows about (ex. soft fault poaching 1 frame off modified/standby)
+// PRECONDITION: caller holds node's lock for reading node->links so Flink/Blink safe without extra locking
 VOID
 RWListRemoveKnown(PCONCURRENT_LIST_HEAD L, pfn_metadata* node)
 {
 #if DEBUG
     {
-        // Node's recorded list type should match the list it is being removed from.
+        // Node's recorded list type should match the list it is being removed from
         ULONG64 expect = (L == &standbyList_head) ? LIST_STANDBY : LIST_MODIFIED;
         if (node->list_type != expect) {
             printf("WRONG-LIST REMOVE: node=%p frame=%llu list_type=%llu removing-from=%s\n",
@@ -115,7 +83,7 @@ RWListRemoveKnown(PCONCURRENT_LIST_HEAD L, pfn_metadata* node)
             ReleaseSRWLockShared(&L->srw);
             return;
         }
-        // node's links are stable because the caller holds node's lock, so re-read fresh.
+        // Node's links are stable because the caller holds node's lock, so re-read fresh
         PLIST_ENTRY succ = entry->Flink;
         PLIST_ENTRY pred = entry->Blink;
         CRITICAL_SECTION* succ_lock = rwlist_node_lock(L, succ);
@@ -125,7 +93,7 @@ RWListRemoveKnown(PCONCURRENT_LIST_HEAD L, pfn_metadata* node)
             if (++fails < LIST_COUPLE_MAX_FAILS) continue;
             goto escalate;
         }
-        // pred and succ can resolve to the same lock (node is the only real entry).
+        // Pred and succ can resolve to the same lock (node is the only real entry)
         BOOLEAN same_lock = (pred_lock == succ_lock);
         if (!same_lock && !TryEnterCriticalSection(pred_lock)) {
             LeaveCriticalSection(succ_lock);
@@ -133,7 +101,7 @@ RWListRemoveKnown(PCONCURRENT_LIST_HEAD L, pfn_metadata* node)
             goto escalate;
         }
 
-        // All three locks held (node's via the caller, succ's and pred's just now).
+        // All three locks held (node's via the caller, succ's and pred's just now)
         pred->Flink = succ;
         succ->Blink = pred;
         entry->Flink = entry->Blink = NULL;
@@ -156,17 +124,8 @@ escalate:
     ReleaseSRWLockExclusive(&L->srw);
 }
 
-// ---------------------------------------------------------------------------------------
-// RWListScanBegin/Next/RemoveCurrent/End: Policy-B "any eligible node" walk under shared
-// access. A contended node ends the pass (returns NULL) rather than escalating; the caller
-// re-scans later to pick it up. The cursor always holds pred (last node confirmed linked)
-// and curr (node most recently returned); advancing promotes curr into pred's place so a
-// later RWListScanRemoveCurrent still has pred to splice around whatever comes next.
-
-// Begin a walk. forward=TRUE walks head->tail (Flink), FALSE walks tail->head (Blink).
-// Returns the first eligible node (with its lock held) or NULL. The blocking wait on
-// head_lock is the only blocking acquire in the whole scan path (everything else is a
-// TryEnter), and its holder never blocks while holding it, so it cannot close a cycle.
+// Policy-B "any eligible node" walk under shared access, caller holds node's lock for reading node->links so Flink/Blink safe without extra locking
+// Begin a walk (head->tail or tail->head) and returns first eligible node or NULL if none
 pfn_metadata*
 RWListScanBegin(PCONCURRENT_LIST_HEAD L, RW_LIST_CURSOR* c, BOOLEAN forward)
 {
@@ -181,9 +140,7 @@ RWListScanBegin(PCONCURRENT_LIST_HEAD L, RW_LIST_CURSOR* c, BOOLEAN forward)
     return RWListScanNext(c);
 }
 
-// Advance one node. Returns the newly-visited node with its OWN lock held (caller must
-// eventually release it, directly or via a successful RWListScanRemoveCurrent handoff), or
-// NULL for either "list exhausted" or "next node contended" -- both mean "stop this pass".
+// Advance one node, returns new node with own lock held (caller evenually releases it)
 pfn_metadata*
 RWListScanNext(RW_LIST_CURSOR* c)
 {
@@ -191,8 +148,7 @@ RWListScanNext(RW_LIST_CURSOR* c)
     PLIST_ENTRY next = c->forward ? from->Flink : from->Blink;
 
     if (next == &c->list->entry) {
-        // Exhausted. If standing on a real node, promote it to pred (drop old pred) so the
-        // cursor is in a well-defined state and RWListScanEnd releases exactly once.
+		// Exhausted, move node to pred and release its lock, then release head_lock and srw
         if (c->curr != NULL) {
             LeaveCriticalSection(c->pred_lock);
             c->pred = c->curr;
@@ -218,8 +174,7 @@ RWListScanNext(RW_LIST_CURSOR* c)
     }
 #endif
 
-    // Advanced: old curr becomes pred (lock ownership transfers, not released) so it stays
-    // available to splice if the caller removes whatever comes next.
+    // Old curr becomes pred (lock ownership transfers)
     if (c->curr != NULL) {
         LeaveCriticalSection(c->pred_lock);
         c->pred = c->curr;
@@ -230,12 +185,7 @@ RWListScanNext(RW_LIST_CURSOR* c)
     return get_pfn_from_PListEntry(next);
 }
 
-// Unlink the node last returned by RWListScanNext. Needs three locks: pred (held), curr
-// (held), and curr's far neighbor (acquired here; same_lock covers a 2-real-node list where
-// it is pred). On success: splices curr out, transfers ownership of curr's lock TO THE
-// CALLER (who must unlock_pfn it), leaves pred positioned so the next ScanNext continues
-// seamlessly, and returns the removed node. On failure (far neighbor contended): nothing
-// changes, curr stays linked and cursor-held, returns NULL -- caller should ScanNext past it.
+// Unlink the node last returned by RWListScanNext
 pfn_metadata*
 RWListScanRemoveCurrent(RW_LIST_CURSOR* c)
 {
@@ -261,14 +211,13 @@ RWListScanRemoveCurrent(RW_LIST_CURSOR* c)
     InterlockedDecrement64(&L->list_count);
 
     if (!same_lock) LeaveCriticalSection(succ_lock);
-    // curr's lock ownership transfers to the caller: deliberately NOT released here.
+    // Curr's lock ownership transfers to the caller
     c->curr = NULL;
     c->curr_lock = NULL;
     return removed;
 }
 
-// End a scan: release curr (NULL if a successful RWListScanRemoveCurrent already handed its
-// lock to the caller), release pred, and drop the shared SRW hold.
+// End a scan, release curr, release pred, drop shared SRW hold
 VOID
 RWListScanEnd(RW_LIST_CURSOR* c)
 {
@@ -277,10 +226,7 @@ RWListScanEnd(RW_LIST_CURSOR* c)
     ReleaseSRWLockShared(&c->list->srw);
 }
 
-// Rescue the current standby node by repointing its owner transition PTE to disc, then
-// unlink it and transfer its lock to the caller. Like RWListScanRemoveCurrent, it needs
-// curr's far neighbor lock; nothing is mutated until both that lock and the rescue succeed,
-// so on contention the node is left fully intact on standby. Returns the pfn or NULL.
+// Rescue the cur standby node by repointing owner transition PTE to disc, then unlink and transfer lock to caller
 pfn_metadata*
 rwlist_scan_rescue_remove(RW_LIST_CURSOR* c)
 {
@@ -295,8 +241,7 @@ rwlist_scan_rescue_remove(RW_LIST_CURSOR* c)
 
     pfn_metadata* pfn = get_pfn_from_PListEntry(c->curr);
 
-    // Commit the PTE repoint before touching the list. If the owner region is contended,
-    // release the far-neighbor lock and leave the node fully intact on standby.
+	// Commit, and if owner region is contended, release far-neighbor lock and leave node linked for next pass
     if (!rescue_standby_to_disc(pfn)) {
         if (!same_lock) LeaveCriticalSection(succ_lock);
         return NULL;

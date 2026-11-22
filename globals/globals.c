@@ -1,8 +1,7 @@
-// globals.c : Definitions for the shared global state of the ZoeVM memory manager.
+// globals.c : Definitions for the shared global state
 // vm.h declares all of these `extern` and define them here
 
 #include "vm.h"
-#include "globals.h"
 
 // Locks
 ULONG64 NUM_PTE_LOCKS = 0;

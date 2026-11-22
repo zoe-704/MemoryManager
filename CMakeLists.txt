@@ -13,8 +13,8 @@ project ("ZoeVM")
 
 # Add source to this project's executable.
 add_executable (ZoeVM
-  "vm/vm.c" "init/init.c" "globals/globals.c" "pte/pte.c" "fault/fault.c" "pfn/pfn.c" "list/list.c" "stats/stats.c" "disc/disc.c"
-  "vm/vm.h" "init/init.h" "globals/globals.h" "pte/pte.h" "fault/fault.h" "pfn/pfn.h" "list/list.h" "stats/stats.h" "disc/disc.h")
+  "vm/vm.c" "init/init.c" "globals/globals.c" "pte/pte.c" "fault/fault.c" "pfn/pfn.c" "list/list.c"  "disc/disc.c"
+  "vm/vm.h" "init/init.h"  "pte/pte.h" "fault/fault.h" "pfn/pfn.h" "list/list.h" "stats/stats.h" "disc/disc.h")
 
 # Each module includes sibling headers by bare name, so put every module
 # directory on the include path.
