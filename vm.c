@@ -1184,7 +1184,7 @@ page_fault_thread_random (PVOID parameter)
 
     elapsed_ms = (double)(end_time.QuadPart - start_time.QuadPart) * 1000.0 / frequency.QuadPart;
 
-    printf("Thread %i finished accessing %u virtual addresses in %.2f ms\n", thread_index, i, elapsed_ms);
+    printf("\nThread %i finished accessing %u virtual addresses in %.2f ms\n", thread_index, i, elapsed_ms);
     return 0;
 }
 
